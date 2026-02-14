@@ -85,20 +85,64 @@ func ValidateTransaction(tx *types.Transaction, head *types.Header, signer types
 	if !rules.IsPrague && tx.Type() == types.SetCodeTxType {
 		return fmt.Errorf("%w: type %d rejected, pool not yet in Prague", core.ErrTxTypeNotSupported, tx.Type())
 	}
+	if !rules.IsPrague && tx.Type() == types.FrameTxType {
+		return fmt.Errorf("%w: type %d rejected, pool not yet in Prague", core.ErrTxTypeNotSupported, tx.Type())
+	}
 	// Check whether the init code size has been exceeded
 	if rules.IsShanghai && tx.To() == nil && len(tx.Data()) > params.MaxInitCodeSize {
 		return fmt.Errorf("%w: code size %v, limit %v", core.ErrMaxInitCodeSizeExceeded, len(tx.Data()), params.MaxInitCodeSize)
-	}
-	if rules.IsOsaka && tx.Gas() > params.MaxTxGas {
-		return fmt.Errorf("%w (cap: %d, tx: %d)", core.ErrGasLimitTooHigh, params.MaxTxGas, tx.Gas())
 	}
 	// Transactions can't be negative. This may never happen using RLP decoded
 	// transactions but may occur for transactions created using the RPC.
 	if tx.Value().Sign() < 0 {
 		return ErrNegativeValue
 	}
+	var frameTx *types.FrameTx
+	if tx.Type() == types.FrameTxType {
+		frameTx = tx.GetFrameTx()
+		if frameTx == nil {
+			return fmt.Errorf("%w: missing frame payload", core.ErrFrameTxInvalid)
+		}
+		if len(frameTx.Frames) == 0 {
+			return fmt.Errorf("%w: frame tx has no frames", core.ErrFrameTxInvalid)
+		}
+		if len(frameTx.Frames) > params.MaxFrames {
+			return fmt.Errorf("%w: frame tx has %d frames, max %d", core.ErrFrameTxInvalid, len(frameTx.Frames), params.MaxFrames)
+		}
+		for i, frame := range frameTx.Frames {
+			if frame.Mode > types.FrameModeSender {
+				return fmt.Errorf("%w: frame %d has invalid mode %d", core.ErrFrameTxInvalid, i, frame.Mode)
+			}
+		}
+		blobFeeCap := tx.BlobGasFeeCap()
+		if len(frameTx.BlobHashes) == 0 {
+			if blobFeeCap != nil && blobFeeCap.Sign() > 0 {
+				return fmt.Errorf("%w: blob fee cap set without blobs", core.ErrFrameTxInvalid)
+			}
+		} else {
+			if blobFeeCap == nil || blobFeeCap.Sign() == 0 {
+				return fmt.Errorf("%w: missing blob fee cap", core.ErrFrameTxInvalid)
+			}
+			if tx.BlobGasFeeCapIntCmp(blobTxMinBlobGasPrice) < 0 {
+				return fmt.Errorf("%w: blob fee cap %v, minimum needed %v", ErrTxGasPriceTooLow, tx.BlobGasFeeCap(), blobTxMinBlobGasPrice)
+			}
+			for i, hash := range frameTx.BlobHashes {
+				if !kzg4844.IsValidVersionedHash(hash[:]) {
+					return fmt.Errorf("blob %d has invalid hash version", i)
+				}
+			}
+		}
+	}
+	// For frame transactions, the effective gas limit includes calldata gas.
+	txGasLimit := tx.Gas()
+	if frameTx != nil {
+		txGasLimit += frameTx.CalldataGas()
+	}
+	if rules.IsOsaka && txGasLimit > params.MaxTxGas {
+		return fmt.Errorf("%w (cap: %d, tx: %d)", core.ErrGasLimitTooHigh, params.MaxTxGas, txGasLimit)
+	}
 	// Ensure the transaction doesn't exceed the current block limit gas
-	if head.GasLimit < tx.Gas() {
+	if head.GasLimit < txGasLimit {
 		return ErrGasLimit
 	}
 	// Sanity check for extremely large numbers (supported by RLP or RPC)
@@ -122,21 +166,35 @@ func ValidateTransaction(tx *types.Transaction, head *types.Header, signer types
 	}
 	// Ensure the transaction has more gas than the bare minimum needed to cover
 	// the transaction metadata
-	intrGas, err := core.IntrinsicGas(tx.Data(), tx.AccessList(), tx.SetCodeAuthorizations(), tx.To() == nil, true, rules.IsIstanbul, rules.IsShanghai)
-	if err != nil {
-		return err
-	}
-	if tx.Gas() < intrGas {
-		return fmt.Errorf("%w: gas %v, minimum needed %v", core.ErrIntrinsicGas, tx.Gas(), intrGas)
-	}
-	// Ensure the transaction can cover floor data gas.
-	if opts.Config.IsPrague(head.Number, head.Time) {
-		floorDataGas, err := core.FloorDataGas(tx.Data())
+	if frameTx != nil {
+		intrGas := params.TxGasEIP8141 + frameTx.CalldataGas()
+		if txGasLimit < intrGas {
+			return fmt.Errorf("%w: gas %v, minimum needed %v", core.ErrIntrinsicGas, txGasLimit, intrGas)
+		}
+	} else {
+		intrGas, err := core.IntrinsicGas(tx.Data(), tx.AccessList(), tx.SetCodeAuthorizations(), tx.To() == nil, true, rules.IsIstanbul, rules.IsShanghai)
 		if err != nil {
 			return err
 		}
-		if tx.Gas() < floorDataGas {
-			return fmt.Errorf("%w: gas %v, minimum needed %v", core.ErrFloorDataGas, tx.Gas(), floorDataGas)
+		if txGasLimit < intrGas {
+			return fmt.Errorf("%w: gas %v, minimum needed %v", core.ErrIntrinsicGas, txGasLimit, intrGas)
+		}
+	}
+	// Ensure the transaction can cover floor data gas.
+	if opts.Config.IsPrague(head.Number, head.Time) {
+		if frameTx != nil {
+			floorDataGas := frameTx.FloorDataGas()
+			if txGasLimit < floorDataGas {
+				return fmt.Errorf("%w: gas %v, minimum needed %v", core.ErrFloorDataGas, txGasLimit, floorDataGas)
+			}
+		} else {
+			floorDataGas, err := core.FloorDataGas(tx.Data())
+			if err != nil {
+				return err
+			}
+			if txGasLimit < floorDataGas {
+				return fmt.Errorf("%w: gas %v, minimum needed %v", core.ErrFloorDataGas, txGasLimit, floorDataGas)
+			}
 		}
 	}
 	// Ensure the gasprice is high enough to cover the requirement of the calling pool

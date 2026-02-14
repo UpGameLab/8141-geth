@@ -1527,6 +1527,30 @@ func MarshalReceipt(receipt *types.Receipt, blockHash common.Hash, blockNumber u
 		fields["blobGasPrice"] = (*hexutil.Big)(receipt.BlobGasPrice)
 	}
 
+	// EIP-8141: include payer and frame receipts for frame transactions.
+	if tx.Type() == types.FrameTxType {
+		fields["payer"] = receipt.Payer
+		if len(receipt.FrameReceipts) > 0 {
+			type frameReceiptJSON struct {
+				Status  hexutil.Uint64 `json:"status"`
+				GasUsed hexutil.Uint64 `json:"gasUsed"`
+				Logs    []*types.Log   `json:"logs"`
+			}
+			frs := make([]frameReceiptJSON, len(receipt.FrameReceipts))
+			for i, fr := range receipt.FrameReceipts {
+				frs[i] = frameReceiptJSON{
+					Status:  hexutil.Uint64(fr.Status),
+					GasUsed: hexutil.Uint64(fr.GasUsed),
+					Logs:    fr.Logs,
+				}
+				if frs[i].Logs == nil {
+					frs[i].Logs = []*types.Log{}
+				}
+			}
+			fields["frameReceipts"] = frs
+		}
+	}
+
 	// If the ContractAddress is 20 0x0 bytes, assume it is not a contract creation
 	if receipt.ContractAddress != (common.Address{}) {
 		fields["contractAddress"] = receipt.ContractAddress

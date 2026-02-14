@@ -42,6 +42,7 @@ var activators = map[int]func(*JumpTable){
 	4762: enable4762,
 	7702: enable7702,
 	7939: enable7939,
+	8141: enable8141,
 }
 
 // EnableEIP enables the given EIP on the config.
@@ -555,4 +556,35 @@ func enable7702(jt *JumpTable) {
 	jt[CALLCODE].dynamicGas = gasCallCodeEIP7702
 	jt[STATICCALL].dynamicGas = gasStaticCallEIP7702
 	jt[DELEGATECALL].dynamicGas = gasDelegateCallEIP7702
+}
+
+// enable8141 applies EIP-8141 (Frame Transaction) opcodes.
+func enable8141(jt *JumpTable) {
+	jt[APPROVE] = &operation{
+		execute:    opApprove,
+		dynamicGas: gasReturn, // Memory expansion gas only.
+		minStack:   minStack(3, 0),
+		maxStack:   maxStack(3, 0),
+		memorySize: memoryReturn,
+	}
+	jt[TXPARAMLOAD] = &operation{
+		execute:     opTxParamLoad,
+		constantGas: GasFastStep,
+		minStack:    minStack(3, 1),
+		maxStack:    maxStack(3, 1),
+	}
+	jt[TXPARAMSIZE] = &operation{
+		execute:     opTxParamSize,
+		constantGas: GasQuickStep,
+		minStack:    minStack(2, 1),
+		maxStack:    maxStack(2, 1),
+	}
+	jt[TXPARAMCOPY] = &operation{
+		execute:     opTxParamCopy,
+		constantGas: GasFastestStep,
+		dynamicGas:  gasTxParamCopy,
+		minStack:    minStack(5, 0),
+		maxStack:    maxStack(5, 0),
+		memorySize:  memoryTxParamCopy,
+	}
 }

@@ -289,7 +289,7 @@ func New(config Config, chain BlockChain) *LegacyPool {
 // pool, specifically, whether it is a Legacy, AccessList or Dynamic transaction.
 func (pool *LegacyPool) Filter(tx *types.Transaction) bool {
 	switch tx.Type() {
-	case types.LegacyTxType, types.AccessListTxType, types.DynamicFeeTxType, types.SetCodeTxType:
+	case types.LegacyTxType, types.AccessListTxType, types.DynamicFeeTxType, types.SetCodeTxType, types.FrameTxType:
 		return true
 	default:
 		return false
@@ -547,9 +547,12 @@ func (pool *LegacyPool) ValidateTxBasics(tx *types.Transaction) error {
 			1<<types.LegacyTxType |
 			1<<types.AccessListTxType |
 			1<<types.DynamicFeeTxType |
-			1<<types.SetCodeTxType,
+			1<<types.SetCodeTxType |
+			1<<types.FrameTxType,
 		MaxSize: txMaxSize,
-		MinTip:  pool.gasTip.Load().ToBig(),
+		// Allow frame transactions with blobs up to the protocol limit.
+		MaxBlobCount: params.BlobTxMaxBlobs,
+		MinTip:       pool.gasTip.Load().ToBig(),
 	}
 	return txpool.ValidateTransaction(tx, pool.currentHead.Load(), pool.signer, opts)
 }
