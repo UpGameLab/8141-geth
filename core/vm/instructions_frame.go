@@ -35,7 +35,7 @@ const (
 // FrameContext holds the context for executing a frame transaction (EIP-8141).
 // It is set on the EVM when processing a frame transaction and provides data
 // needed by the TXPARAM* opcodes. All fields are populated from the flattened
-// Message during executeFrameTx().
+// Message during executeFrames().
 type FrameContext struct {
 	Sender       common.Address  // tx.sender
 	Nonce        uint64          // tx.nonce

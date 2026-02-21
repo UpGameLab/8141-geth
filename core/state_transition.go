@@ -295,33 +295,39 @@ func (st *stateTransition) to() common.Address {
 }
 
 func (st *stateTransition) buyGas() error {
+	isFrameTx := st.msg.Frames != nil
+
 	mgval := new(big.Int).SetUint64(st.msg.GasLimit)
 	mgval.Mul(mgval, st.msg.GasPrice)
-	balanceCheck := new(big.Int).Set(mgval)
-	if st.msg.GasFeeCap != nil {
-		balanceCheck.SetUint64(st.msg.GasLimit)
-		balanceCheck = balanceCheck.Mul(balanceCheck, st.msg.GasFeeCap)
-	}
-	balanceCheck.Add(balanceCheck, st.msg.Value)
 
-	if st.evm.ChainConfig().IsCancun(st.evm.Context.BlockNumber, st.evm.Context.Time) {
-		if blobGas := st.blobGasUsed(); blobGas > 0 {
-			// Check that the user has enough funds to cover blobGasUsed * tx.BlobGasFeeCap
-			blobBalanceCheck := new(big.Int).SetUint64(blobGas)
-			blobBalanceCheck.Mul(blobBalanceCheck, st.msg.BlobGasFeeCap)
-			balanceCheck.Add(balanceCheck, blobBalanceCheck)
-			// Pay for blobGasUsed * actual blob fee
-			blobFee := new(big.Int).SetUint64(blobGas)
-			blobFee.Mul(blobFee, st.evm.Context.BlobBaseFee)
-			mgval.Add(mgval, blobFee)
+	// Frame tx doesn't charge ETH from sender upfront — payer pays later via APPROVE.
+	if !isFrameTx {
+		balanceCheck := new(big.Int).Set(mgval)
+		if st.msg.GasFeeCap != nil {
+			balanceCheck.SetUint64(st.msg.GasLimit)
+			balanceCheck = balanceCheck.Mul(balanceCheck, st.msg.GasFeeCap)
 		}
-	}
-	balanceCheckU256, overflow := uint256.FromBig(balanceCheck)
-	if overflow {
-		return fmt.Errorf("%w: address %v required balance exceeds 256 bits", ErrInsufficientFunds, st.msg.From.Hex())
-	}
-	if have, want := st.state.GetBalance(st.msg.From), balanceCheckU256; have.Cmp(want) < 0 {
-		return fmt.Errorf("%w: address %v have %v want %v", ErrInsufficientFunds, st.msg.From.Hex(), have, want)
+		balanceCheck.Add(balanceCheck, st.msg.Value)
+
+		if st.evm.ChainConfig().IsCancun(st.evm.Context.BlockNumber, st.evm.Context.Time) {
+			if blobGas := st.blobGasUsed(); blobGas > 0 {
+				// Check that the user has enough funds to cover blobGasUsed * tx.BlobGasFeeCap
+				blobBalanceCheck := new(big.Int).SetUint64(blobGas)
+				blobBalanceCheck.Mul(blobBalanceCheck, st.msg.BlobGasFeeCap)
+				balanceCheck.Add(balanceCheck, blobBalanceCheck)
+				// Pay for blobGasUsed * actual blob fee
+				blobFee := new(big.Int).SetUint64(blobGas)
+				blobFee.Mul(blobFee, st.evm.Context.BlobBaseFee)
+				mgval.Add(mgval, blobFee)
+			}
+		}
+		balanceCheckU256, overflow := uint256.FromBig(balanceCheck)
+		if overflow {
+			return fmt.Errorf("%w: address %v required balance exceeds 256 bits", ErrInsufficientFunds, st.msg.From.Hex())
+		}
+		if have, want := st.state.GetBalance(st.msg.From), balanceCheckU256; have.Cmp(want) < 0 {
+			return fmt.Errorf("%w: address %v have %v want %v", ErrInsufficientFunds, st.msg.From.Hex(), have, want)
+		}
 	}
 	if err := st.gp.SubGas(st.msg.GasLimit); err != nil {
 		return err
@@ -331,10 +337,12 @@ func (st *stateTransition) buyGas() error {
 		st.evm.Config.Tracer.OnGasChange(0, st.msg.GasLimit, tracing.GasChangeTxInitialBalance)
 	}
 	st.gasRemaining = st.msg.GasLimit
-
 	st.initialGas = st.msg.GasLimit
-	mgvalU256, _ := uint256.FromBig(mgval)
-	st.state.SubBalance(st.msg.From, mgvalU256, tracing.BalanceDecreaseGasBuy)
+
+	if !isFrameTx {
+		mgvalU256, _ := uint256.FromBig(mgval)
+		st.state.SubBalance(st.msg.From, mgvalU256, tracing.BalanceDecreaseGasBuy)
+	}
 	return nil
 }
 
@@ -361,11 +369,13 @@ func (st *stateTransition) preCheck() error {
 		if isOsaka && msg.GasLimit > params.MaxTxGas {
 			return fmt.Errorf("%w (cap: %d, tx: %d)", ErrGasLimitTooHigh, params.MaxTxGas, msg.GasLimit)
 		}
-		// Make sure the sender is an EOA
-		code := st.state.GetCode(msg.From)
-		_, delegated := types.ParseDelegation(code)
-		if len(code) > 0 && !delegated {
-			return fmt.Errorf("%w: address %v, len(code): %d", ErrSenderNoEOA, msg.From.Hex(), len(code))
+		// Make sure the sender is an EOA (frame tx senders may have code).
+		if msg.Frames == nil {
+			code := st.state.GetCode(msg.From)
+			_, delegated := types.ParseDelegation(code)
+			if len(code) > 0 && !delegated {
+				return fmt.Errorf("%w: address %v, len(code): %d", ErrSenderNoEOA, msg.From.Hex(), len(code))
+			}
 		}
 	}
 	// Make sure that transaction gasFeeCap is greater than the baseFee (post london)
@@ -398,10 +408,12 @@ func (st *stateTransition) preCheck() error {
 		// The to field of a blob tx type is mandatory, and a `BlobTx` transaction internally
 		// has it as a non-nillable value, so any msg derived from blob transaction has it non-nil.
 		// However, messages created through RPC (eth_call) don't have this restriction.
-		if msg.To == nil {
+		// Frame tx has no To field; this check only applies to blob-type txs.
+		if msg.To == nil && msg.Frames == nil {
 			return ErrBlobTxCreate
 		}
-		if len(msg.BlobHashes) == 0 {
+		// Frame tx may have 0 blob hashes (blobs are optional).
+		if len(msg.BlobHashes) == 0 && msg.Frames == nil {
 			return ErrMissingBlobHashes
 		}
 		if isOsaka && len(msg.BlobHashes) > params.BlobTxMaxBlobs {
@@ -451,9 +463,17 @@ func (st *stateTransition) preCheck() error {
 // However if any consensus issue encountered, return the error directly with
 // nil evm execution result.
 func (st *stateTransition) execute() (*ExecutionResult, error) {
-	// EIP-8141: Frame transactions use a dedicated execution path.
-	if st.msg.Frames != nil {
-		return st.executeFrameTx()
+	msg := st.msg
+	isFrameTx := msg.Frames != nil
+
+	// EIP-8141: validate frame count before preCheck.
+	if isFrameTx {
+		if len(msg.Frames) == 0 {
+			return nil, fmt.Errorf("%w: frame tx has no frames", ErrFrameTxInvalid)
+		}
+		if len(msg.Frames) > params.MaxFrames {
+			return nil, fmt.Errorf("%w: frame tx has %d frames, max %d", ErrFrameTxInvalid, len(msg.Frames), params.MaxFrames)
+		}
 	}
 
 	// First check this message satisfies all consensus rules before
@@ -472,67 +492,102 @@ func (st *stateTransition) execute() (*ExecutionResult, error) {
 	}
 
 	var (
-		msg              = st.msg
 		rules            = st.evm.ChainConfig().Rules(st.evm.Context.BlockNumber, st.evm.Context.Random != nil, st.evm.Context.Time)
-		contractCreation = msg.To == nil
+		contractCreation = !isFrameTx && msg.To == nil
 		floorDataGas     uint64
+		gas              uint64
 	)
 
 	// Check clauses 4-5, subtract intrinsic gas if everything is correct
-	gas, err := IntrinsicGas(msg.Data, msg.AccessList, msg.SetCodeAuthorizations, contractCreation, rules.IsHomestead, rules.IsIstanbul, rules.IsShanghai)
-	if err != nil {
-		return nil, err
+	if isFrameTx {
+		// Frame intrinsic gas = GasLimit - sum(frame.GasLimit).
+		var frameGasSum uint64
+		for _, f := range msg.Frames {
+			if f.GasLimit > math.MaxUint64-frameGasSum {
+				return nil, fmt.Errorf("%w: frame gas limits overflow uint64", ErrFrameTxInvalid)
+			}
+			frameGasSum += f.GasLimit
+		}
+		if msg.GasLimit < frameGasSum {
+			return nil, fmt.Errorf("%w: gas limit %d < frame gas sum %d", ErrFrameTxInvalid, msg.GasLimit, frameGasSum)
+		}
+		gas = msg.GasLimit - frameGasSum
+		floorDataGas = msg.FrameFloorDataGas
+	} else {
+		var err error
+		gas, err = IntrinsicGas(msg.Data, msg.AccessList, msg.SetCodeAuthorizations, contractCreation, rules.IsHomestead, rules.IsIstanbul, rules.IsShanghai)
+		if err != nil {
+			return nil, err
+		}
+		if rules.IsPrague {
+			floorDataGas, err = FloorDataGas(msg.Data)
+			if err != nil {
+				return nil, err
+			}
+		}
 	}
 	if st.gasRemaining < gas {
 		return nil, fmt.Errorf("%w: have %d, want %d", ErrIntrinsicGas, st.gasRemaining, gas)
 	}
 	// Gas limit suffices for the floor data cost (EIP-7623)
-	if rules.IsPrague {
-		floorDataGas, err = FloorDataGas(msg.Data)
-		if err != nil {
-			return nil, err
-		}
-		if msg.GasLimit < floorDataGas {
-			return nil, fmt.Errorf("%w: have %d, want %d", ErrFloorDataGas, msg.GasLimit, floorDataGas)
-		}
+	if rules.IsPrague && msg.GasLimit < floorDataGas {
+		return nil, fmt.Errorf("%w: have %d, want %d", ErrFloorDataGas, msg.GasLimit, floorDataGas)
 	}
 	if t := st.evm.Config.Tracer; t != nil && t.OnGasChange != nil {
 		t.OnGasChange(st.gasRemaining, st.gasRemaining-gas, tracing.GasChangeTxIntrinsicGas)
 	}
 	st.gasRemaining -= gas
 
-	if rules.IsEIP4762 {
-		st.evm.AccessEvents.AddTxOrigin(msg.From)
+	if !isFrameTx {
+		if rules.IsEIP4762 {
+			st.evm.AccessEvents.AddTxOrigin(msg.From)
 
-		if targetAddr := msg.To; targetAddr != nil {
-			st.evm.AccessEvents.AddTxDestination(*targetAddr, msg.Value.Sign() != 0, !st.state.Exist(*targetAddr))
+			if targetAddr := msg.To; targetAddr != nil {
+				st.evm.AccessEvents.AddTxDestination(*targetAddr, msg.Value.Sign() != 0, !st.state.Exist(*targetAddr))
+			}
 		}
-	}
 
-	// Check clause 6
-	value, overflow := uint256.FromBig(msg.Value)
-	if overflow {
-		return nil, fmt.Errorf("%w: address %v", ErrInsufficientFundsForTransfer, msg.From.Hex())
-	}
-	if !value.IsZero() && !st.evm.Context.CanTransfer(st.state, msg.From, value) {
-		return nil, fmt.Errorf("%w: address %v", ErrInsufficientFundsForTransfer, msg.From.Hex())
-	}
+		// Check clause 6
+		value, overflow := uint256.FromBig(msg.Value)
+		if overflow {
+			return nil, fmt.Errorf("%w: address %v", ErrInsufficientFundsForTransfer, msg.From.Hex())
+		}
+		if !value.IsZero() && !st.evm.Context.CanTransfer(st.state, msg.From, value) {
+			return nil, fmt.Errorf("%w: address %v", ErrInsufficientFundsForTransfer, msg.From.Hex())
+		}
 
-	// Check whether the init code size has been exceeded.
-	if rules.IsShanghai && contractCreation && len(msg.Data) > params.MaxInitCodeSize {
-		return nil, fmt.Errorf("%w: code size %v limit %v", ErrMaxInitCodeSizeExceeded, len(msg.Data), params.MaxInitCodeSize)
+		// Check whether the init code size has been exceeded.
+		if rules.IsShanghai && contractCreation && len(msg.Data) > params.MaxInitCodeSize {
+			return nil, fmt.Errorf("%w: code size %v limit %v", ErrMaxInitCodeSizeExceeded, len(msg.Data), params.MaxInitCodeSize)
+		}
 	}
 
 	// Execute the preparatory steps for state transition which includes:
 	// - prepare accessList(post-berlin)
 	// - reset transient storage(eip 1153)
-	st.state.Prepare(rules, msg.From, st.evm.Context.Coinbase, msg.To, vm.ActivePrecompiles(rules), msg.AccessList)
+	if isFrameTx {
+		st.state.Prepare(rules, msg.From, st.evm.Context.Coinbase, nil, vm.ActivePrecompiles(rules), nil)
+	} else {
+		st.state.Prepare(rules, msg.From, st.evm.Context.Coinbase, msg.To, vm.ActivePrecompiles(rules), msg.AccessList)
+	}
 
 	var (
-		ret   []byte
-		vmerr error // vm errors do not effect consensus and are therefore not assigned to err
+		ret            []byte
+		vmerr          error // vm errors do not effect consensus and are therefore not assigned to err
+		payer          = msg.From
+		frameResults   []uint8
+		frameGasUsed   []uint64
+		frameLogRanges []frameLogRange
 	)
-	if contractCreation {
+
+	if isFrameTx {
+		var err error
+		payer, frameResults, frameGasUsed, frameLogRanges, err = st.executeFrames()
+		if err != nil {
+			return nil, err
+		}
+	} else if contractCreation {
+		value, _ := uint256.FromBig(msg.Value)
 		ret, _, st.gasRemaining, vmerr = st.evm.Create(msg.From, msg.Data, st.gasRemaining, value)
 	} else {
 		// Increment the nonce for the next transaction.
@@ -555,6 +610,7 @@ func (st *stateTransition) execute() (*ExecutionResult, error) {
 			st.state.AddAddressToAccessList(addr)
 		}
 
+		value, _ := uint256.FromBig(msg.Value)
 		// Execute the transaction's call.
 		ret, st.gasRemaining, vmerr = st.evm.Call(msg.From, st.to(), msg.Data, st.gasRemaining, value)
 	}
@@ -578,7 +634,8 @@ func (st *stateTransition) execute() (*ExecutionResult, error) {
 			peakGasUsed = floorDataGas
 		}
 	}
-	st.returnGas()
+	// Return unused gas to payer (sender for regular tx, payer for frame tx).
+	st.returnGasTo(payer)
 
 	effectiveTip := msg.GasPrice
 	if rules.IsLondon {
@@ -601,12 +658,19 @@ func (st *stateTransition) execute() (*ExecutionResult, error) {
 		}
 	}
 
-	return &ExecutionResult{
+	result := &ExecutionResult{
 		UsedGas:    st.gasUsed(),
 		MaxUsedGas: peakGasUsed,
 		Err:        vmerr,
 		ReturnData: ret,
-	}, nil
+	}
+	if isFrameTx {
+		result.frameResults = frameResults
+		result.frameGasUsed = frameGasUsed
+		result.frameLogRange = frameLogRanges
+		result.payer = payer
+	}
+	return result, nil
 }
 
 // validateAuthorization validates an EIP-7702 authorization against the state.
@@ -686,12 +750,12 @@ func (st *stateTransition) calcRefund() uint64 {
 	return refund
 }
 
-// returnGas returns ETH for remaining gas,
+// returnGasTo returns ETH for remaining gas to the given recipient,
 // exchanged at the original rate.
-func (st *stateTransition) returnGas() {
+func (st *stateTransition) returnGasTo(recipient common.Address) {
 	remaining := uint256.NewInt(st.gasRemaining)
 	remaining.Mul(remaining, uint256.MustFromBig(st.msg.GasPrice))
-	st.state.AddBalance(st.msg.From, remaining, tracing.BalanceIncreaseGasReturn)
+	st.state.AddBalance(recipient, remaining, tracing.BalanceIncreaseGasReturn)
 
 	if st.evm.Config.Tracer != nil && st.evm.Config.Tracer.OnGasChange != nil && st.gasRemaining > 0 {
 		st.evm.Config.Tracer.OnGasChange(st.gasRemaining, 0, tracing.GasChangeTxLeftOverReturned)
@@ -712,118 +776,14 @@ func (st *stateTransition) blobGasUsed() uint64 {
 	return uint64(len(st.msg.BlobHashes) * params.BlobTxBlobGasPerBlob)
 }
 
-// executeFrameTx implements the EIP-8141 frame transaction execution.
-// It handles nonce validation, gas reservation, frame-by-frame execution,
-// approval tracking, gas collection from the payer, and refunds.
-func (st *stateTransition) executeFrameTx() (*ExecutionResult, error) {
+// executeFrames implements the EIP-8141 frame-by-frame execution loop.
+// It sets up the FrameContext, executes each frame, tracks APPROVE/payment
+// approval, and returns the payer address and per-frame results.
+// Validation, gas reservation, refunds, and miner tip are handled by execute().
+func (st *stateTransition) executeFrames() (common.Address, []uint8, []uint64, []frameLogRange, error) {
 	msg := st.msg
-	rules := st.evm.ChainConfig().Rules(st.evm.Context.BlockNumber, st.evm.Context.Random != nil, st.evm.Context.Time)
 
-	// --- Validation (replaces preCheck for frame tx) ---
-
-	// 0. Frame count validation (EIP-8141: assert len(tx.frames) > 0 and <= MAX_FRAMES).
-	if len(msg.Frames) == 0 {
-		return nil, fmt.Errorf("%w: frame tx has no frames", ErrFrameTxInvalid)
-	}
-	if len(msg.Frames) > params.MaxFrames {
-		return nil, fmt.Errorf("%w: frame tx has %d frames, max %d", ErrFrameTxInvalid, len(msg.Frames), params.MaxFrames)
-	}
-
-	// 1. Nonce check.
-	if !msg.SkipNonceChecks {
-		stNonce := st.state.GetNonce(msg.From)
-		if msgNonce := msg.Nonce; stNonce < msgNonce {
-			return nil, fmt.Errorf("%w: address %v, tx: %d state: %d", ErrNonceTooHigh,
-				msg.From.Hex(), msgNonce, stNonce)
-		} else if stNonce > msgNonce {
-			return nil, fmt.Errorf("%w: address %v, tx: %d state: %d", ErrNonceTooLow,
-				msg.From.Hex(), msgNonce, stNonce)
-		} else if stNonce+1 < stNonce {
-			return nil, fmt.Errorf("%w: address %v, nonce: %d", ErrNonceMax,
-				msg.From.Hex(), stNonce)
-		}
-	}
-
-	// 2. Fee checks (baseFee, blobFee). Skip EOA check — frame tx senders may have code.
-	if !msg.SkipTransactionChecks {
-		if st.evm.ChainConfig().IsLondon(st.evm.Context.BlockNumber) {
-			skipCheck := st.evm.Config.NoBaseFee && msg.GasFeeCap.BitLen() == 0 && msg.GasTipCap.BitLen() == 0
-			if !skipCheck {
-				if l := msg.GasFeeCap.BitLen(); l > 256 {
-					return nil, fmt.Errorf("%w: address %v, maxFeePerGas bit length: %d", ErrFeeCapVeryHigh,
-						msg.From.Hex(), l)
-				}
-				if l := msg.GasTipCap.BitLen(); l > 256 {
-					return nil, fmt.Errorf("%w: address %v, maxPriorityFeePerGas bit length: %d", ErrTipVeryHigh,
-						msg.From.Hex(), l)
-				}
-				if msg.GasFeeCap.Cmp(msg.GasTipCap) < 0 {
-					return nil, fmt.Errorf("%w: address %v, maxPriorityFeePerGas: %s, maxFeePerGas: %s", ErrTipAboveFeeCap,
-						msg.From.Hex(), msg.GasTipCap, msg.GasFeeCap)
-				}
-				if msg.GasFeeCap.Cmp(st.evm.Context.BaseFee) < 0 {
-					return nil, fmt.Errorf("%w: address %v, maxFeePerGas: %s, baseFee: %s", ErrFeeCapTooLow,
-						msg.From.Hex(), msg.GasFeeCap, st.evm.Context.BaseFee)
-				}
-			}
-		}
-		// EIP-7825: enforce per-transaction gas limit cap (Osaka+).
-		// msg.GasLimit for frame tx = TxGasEIP8141 + calldataGas + Σframe.GasLimit.
-		if st.evm.ChainConfig().IsOsaka(st.evm.Context.BlockNumber, st.evm.Context.Time) {
-			if msg.GasLimit > params.MaxTxGas {
-				return nil, fmt.Errorf("%w (cap: %d, tx: %d)", ErrGasLimitTooHigh, params.MaxTxGas, msg.GasLimit)
-			}
-		}
-		if blobGas := st.blobGasUsed(); blobGas > 0 {
-			skipCheck := st.evm.Config.NoBaseFee && msg.BlobGasFeeCap.BitLen() == 0
-			if !skipCheck {
-				if msg.BlobGasFeeCap.Cmp(st.evm.Context.BlobBaseFee) < 0 {
-					return nil, fmt.Errorf("%w: address %v blobGasFeeCap: %v, blobBaseFee: %v", ErrBlobFeeCapTooLow,
-						msg.From.Hex(), msg.BlobGasFeeCap, st.evm.Context.BlobBaseFee)
-				}
-			}
-		}
-		for i, hash := range msg.BlobHashes {
-			if !kzg4844.IsValidVersionedHash(hash[:]) {
-				return nil, fmt.Errorf("blob %d has invalid hash version", i)
-			}
-		}
-	}
-
-	// 3. Reserve gas from block gas pool (don't charge ETH yet — payer is determined later).
-	if err := st.gp.SubGas(msg.GasLimit); err != nil {
-		return nil, err
-	}
-	st.gasRemaining = msg.GasLimit
-	st.initialGas = msg.GasLimit
-
-	// 4. Subtract intrinsic gas. For frame tx:
-	//    total = TxGasEIP8141 + calldataCost + sum(frame.gas_limit)
-	//    intrinsicGas = total - sum(frame.gas_limit) = TxGasEIP8141 + calldataCost
-	var frameGasSum uint64
-	for _, f := range msg.Frames {
-		if f.GasLimit > math.MaxUint64-frameGasSum {
-			return nil, fmt.Errorf("%w: frame gas limits overflow uint64", ErrFrameTxInvalid)
-		}
-		frameGasSum += f.GasLimit
-	}
-	if msg.GasLimit < frameGasSum {
-		return nil, fmt.Errorf("%w: gas limit %d < frame gas sum %d", ErrFrameTxInvalid, msg.GasLimit, frameGasSum)
-	}
-	intrinsicGas := msg.GasLimit - frameGasSum
-	if st.gasRemaining < intrinsicGas {
-		return nil, fmt.Errorf("%w: have %d, want %d", ErrIntrinsicGas, st.gasRemaining, intrinsicGas)
-	}
-	// EIP-7623: gas limit must suffice for the floor data cost.
-	if msg.GasLimit < msg.FrameFloorDataGas {
-		return nil, fmt.Errorf("%w: have %d, want %d", ErrFloorDataGas, msg.GasLimit, msg.FrameFloorDataGas)
-	}
-	st.gasRemaining -= intrinsicGas
-
-	// 5. Prepare state (access list, transient storage reset).
-	st.state.Prepare(rules, msg.From, st.evm.Context.Coinbase, nil, vm.ActivePrecompiles(rules), nil)
-
-	// 6. Setup FrameContext on EVM.
+	// Setup FrameContext on EVM.
 	gasTipCap, _ := uint256.FromBig(msg.GasTipCap)
 	gasFeeCap, _ := uint256.FromBig(msg.GasFeeCap)
 	blobFeeCap, _ := uint256.FromBig(msg.BlobGasFeeCap)
@@ -843,7 +803,6 @@ func (st *stateTransition) executeFrameTx() (*ExecutionResult, error) {
 	st.evm.FrameCtx = frameCtx
 	defer func() { st.evm.FrameCtx = nil }()
 
-	// 7. Execute frames.
 	var (
 		senderApproved bool
 		payerApproved  bool
@@ -870,7 +829,7 @@ func (st *stateTransition) executeFrameTx() (*ExecutionResult, error) {
 		}
 
 		if frame.Mode > types.FrameModeSender {
-			return nil, fmt.Errorf("%w: frame %d has invalid mode %d", ErrFrameTxInvalid, i, frame.Mode)
+			return common.Address{}, nil, nil, nil, fmt.Errorf("%w: frame %d has invalid mode %d", ErrFrameTxInvalid, i, frame.Mode)
 		}
 
 		// Determine caller based on mode.
@@ -880,7 +839,7 @@ func (st *stateTransition) executeFrameTx() (*ExecutionResult, error) {
 			caller = params.FrameEntryPointAddress
 		case types.FrameModeSender:
 			if !senderApproved {
-				return nil, fmt.Errorf("%w: SENDER mode in frame %d before sender approved", ErrFrameTxInvalid, i)
+				return common.Address{}, nil, nil, nil, fmt.Errorf("%w: SENDER mode in frame %d before sender approved", ErrFrameTxInvalid, i)
 			}
 			caller = msg.From
 		}
@@ -919,7 +878,6 @@ func (st *stateTransition) executeFrameTx() (*ExecutionResult, error) {
 			frameCtx.FrameResults[i] = 0
 		} else if approveStatus >= vm.ApproveExecution && approveStatus <= vm.ApproveBoth {
 			// APPROVE was called. Process approval rules.
-			// Capture sender approval state before this frame's processing.
 			senderApprovedBefore := senderApproved
 
 			needRevert := false
@@ -940,22 +898,17 @@ func (st *stateTransition) executeFrameTx() (*ExecutionResult, error) {
 			// Rule for status 3 (payment approval).
 			if !needRevert && (approveStatus == vm.ApprovePayment || approveStatus == vm.ApproveBoth) {
 				if !senderApprovedBefore && approveStatus == vm.ApprovePayment {
-					// Cannot approve payment before sender approval with pure status 3.
 					needRevert = true
 				} else if senderApprovedBefore && approveStatus == vm.ApproveBoth {
-					// Cannot use status 4 when sender was already approved separately.
 					needRevert = true
 				} else if payerApproved {
-					// Cannot re-approve payment.
 					needRevert = true
 				} else {
-					// Collect total gas cost from payer.
 					if err := st.collectGasFromPayer(target); err != nil {
-						return nil, err
+						return common.Address{}, nil, nil, nil, err
 					}
 					payer = target
 					payerApproved = true
-					// Increment sender's nonce.
 					st.state.SetNonce(msg.From, st.state.GetNonce(msg.From)+1, tracing.NonceChangeEoACall)
 				}
 			}
@@ -981,58 +934,19 @@ func (st *stateTransition) executeFrameTx() (*ExecutionResult, error) {
 		if frame.Mode == types.FrameModeVerify {
 			status := frameCtx.FrameResults[i]
 			if status < vm.ApproveExecution || status > vm.ApproveBoth {
-				return nil, fmt.Errorf("%w: VERIFY frame %d did not APPROVE (status %d)", ErrFrameTxInvalid, i, status)
+				return common.Address{}, nil, nil, nil, fmt.Errorf("%w: VERIFY frame %d did not APPROVE (status %d)", ErrFrameTxInvalid, i, status)
 			}
 		}
 	}
 
-	// 8. Verify payer_approved.
 	if !payerApproved {
-		return nil, ErrFrameTxPayerNotApproved
+		return common.Address{}, nil, nil, nil, ErrFrameTxPayerNotApproved
 	}
 
-	// 9. Compute gas usage and refund.
+	// Subtract total frame gas usage from remaining gas.
 	st.gasRemaining -= totalGasUsed
 
-	// Apply storage refunds (capped per EIP-3529).
-	st.gasRemaining += st.calcRefund()
-
-	// EIP-7623: data-heavy transactions pay the floor gas.
-	if st.gasUsed() < msg.FrameFloorDataGas {
-		st.gasRemaining = st.initialGas - msg.FrameFloorDataGas
-	}
-
-	// 10. Return unused gas ETH to payer.
-	remaining := uint256.NewInt(st.gasRemaining)
-	remaining.Mul(remaining, uint256.MustFromBig(msg.GasPrice))
-	st.state.AddBalance(payer, remaining, tracing.BalanceIncreaseGasReturn)
-
-	// Return unused gas to block gas pool.
-	st.gp.AddGas(st.gasRemaining)
-
-	// 11. Pay miner/validator fee.
-	effectiveTip := msg.GasPrice
-	if rules.IsLondon {
-		effectiveTip = new(big.Int).Sub(msg.GasPrice, st.evm.Context.BaseFee)
-	}
-	effectiveTipU256, _ := uint256.FromBig(effectiveTip)
-	if st.evm.Config.NoBaseFee && msg.GasFeeCap.Sign() == 0 && msg.GasTipCap.Sign() == 0 {
-		// Skip fee payment when NoBaseFee is set and fee fields are 0.
-	} else {
-		fee := new(uint256.Int).SetUint64(st.gasUsed())
-		fee.Mul(fee, effectiveTipU256)
-		st.state.AddBalance(st.evm.Context.Coinbase, fee, tracing.BalanceIncreaseRewardTransactionFee)
-	}
-
-	return &ExecutionResult{
-		UsedGas:       st.gasUsed(),
-		MaxUsedGas:    st.gasUsed(),
-		Err:           nil,
-		frameResults:  frameResults,
-		frameGasUsed:  frameGasUsed,
-		frameLogRange: frameLogRanges,
-		payer:         payer,
-	}, nil
+	return payer, frameResults, frameGasUsed, frameLogRanges, nil
 }
 
 // collectGasFromPayer charges the total transaction gas cost from the payer account.

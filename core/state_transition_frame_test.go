@@ -124,7 +124,7 @@ func TestFrameTxSimple(t *testing.T) {
 	msg := makeFrameMsg(ftx, config, big.NewInt(params.InitialBaseFee))
 	result, err := applyFrameTx(evm, config, msg)
 	if err != nil {
-		t.Fatalf("executeFrameTx failed: %v", err)
+		t.Fatalf("execute failed: %v", err)
 	}
 	if result.Failed() {
 		t.Fatalf("execution result failed: %v", result.Err)
@@ -714,7 +714,7 @@ func TestFrameTxTxParamLoad(t *testing.T) {
 	}
 }
 
-// TestFrameTxFrameGasSumOverflow verifies that executeFrameTx detects when the sum
+// TestFrameTxFrameGasSumOverflow verifies that execute detects when the sum
 // of per-frame gas limits overflows uint64 and returns ErrFrameTxInvalid.
 func TestFrameTxFrameGasSumOverflow(t *testing.T) {
 	evm, _, _ := newFrameTestEnv()
@@ -722,16 +722,14 @@ func TestFrameTxFrameGasSumOverflow(t *testing.T) {
 	sender := common.HexToAddress("0xaaaa")
 	// Frame 1: MaxUint64 - 100. Frame 2: 200. Sum = MaxUint64 - 100 + 200 overflows.
 	msg := &Message{
-		From:      sender,
-		GasLimit:  100_000,
-		GasFeeCap: new(big.Int),
-		GasTipCap: new(big.Int),
-		GasPrice:  new(big.Int),
-		Value:     new(big.Int),
-		// SkipTransactionChecks bypasses fee + Osaka-cap checks so we reach
-		// the frame-gas-sum check regardless of fee parameters.
-		SkipNonceChecks:       true,
-		SkipTransactionChecks: true,
+		From:            sender,
+		GasLimit:        100_000,
+		GasFeeCap:       big.NewInt(params.InitialBaseFee),
+		GasTipCap:       new(big.Int),
+		GasPrice:        big.NewInt(params.InitialBaseFee),
+		BlobGasFeeCap:   new(big.Int),
+		Value:           new(big.Int),
+		SkipNonceChecks: true,
 		Frames: []types.Frame{
 			{Mode: types.FrameModeDefault, GasLimit: math.MaxUint64 - 100},
 			{Mode: types.FrameModeDefault, GasLimit: 200},
@@ -747,7 +745,7 @@ func TestFrameTxFrameGasSumOverflow(t *testing.T) {
 	}
 }
 
-// TestFrameTxOsakaGasCap verifies that executeFrameTx enforces the EIP-7825
+// TestFrameTxOsakaGasCap verifies that execute enforces the EIP-7825
 // per-transaction gas limit cap (params.MaxTxGas) when Osaka is active.
 func TestFrameTxOsakaGasCap(t *testing.T) {
 	// MergedTestChainConfig has OsakaTime=0, so Osaka is always active.
