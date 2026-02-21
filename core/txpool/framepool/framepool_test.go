@@ -1,0 +1,395 @@
+// Copyright 2026 The go-ethereum Authors
+// This file is part of the go-ethereum library.
+//
+// The go-ethereum library is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Lesser General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// The go-ethereum library is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU Lesser General Public License for more details.
+//
+// You should have received a copy of the GNU Lesser General Public License
+// along with the go-ethereum library. If not, see <http://www.gnu.org/licenses/>.
+
+package framepool
+
+import (
+	"math/big"
+	"sync"
+	"testing"
+
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core/state"
+	"github.com/ethereum/go-ethereum/core/tracing"
+	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/params"
+	"github.com/holiman/uint256"
+)
+
+// --- Test helpers ---
+
+// testChain implements BlockChain for tests.
+type testChain struct {
+	config  *params.ChainConfig
+	statedb *state.StateDB
+	head    *types.Header
+}
+
+func (c *testChain) Config() *params.ChainConfig        { return c.config }
+func (c *testChain) CurrentBlock() *types.Header         { return c.head }
+func (c *testChain) StateAt(common.Hash) (*state.StateDB, error) { return c.statedb, nil }
+
+// reserver implements txpool.Reserver for tests.
+type reserver struct {
+	lock     sync.Mutex
+	accounts map[common.Address]struct{}
+}
+
+func newReserver() *reserver {
+	return &reserver{accounts: make(map[common.Address]struct{})}
+}
+
+func (r *reserver) Hold(addr common.Address) error {
+	r.lock.Lock()
+	defer r.lock.Unlock()
+	if _, exists := r.accounts[addr]; exists {
+		return nil // allow re-reservation in tests
+	}
+	r.accounts[addr] = struct{}{}
+	return nil
+}
+
+func (r *reserver) Release(addr common.Address) error {
+	r.lock.Lock()
+	defer r.lock.Unlock()
+	delete(r.accounts, addr)
+	return nil
+}
+
+func (r *reserver) Has(addr common.Address) bool {
+	r.lock.Lock()
+	defer r.lock.Unlock()
+	_, exists := r.accounts[addr]
+	return exists
+}
+
+// Bytecode constants.
+var (
+	// APPROVE(0x2): PUSH1 0x02, PUSH1 0x00, PUSH1 0x00, APPROVE(0xaa)
+	approveBothCode = []byte{0x60, 0x02, 0x60, 0x00, 0x60, 0x00, 0xaa}
+
+	// APPROVE(0x0): PUSH1 0x00, PUSH1 0x00, PUSH1 0x00, APPROVE(0xaa)
+	approveExecCode = []byte{0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0xaa}
+
+	// Simple RETURN: PUSH1 0x00, PUSH1 0x00, RETURN(0xf3)
+	returnCode = []byte{0x60, 0x00, 0x60, 0x00, 0xf3}
+
+	// TIMESTAMP then APPROVE(0x2): TIMESTAMP, PUSH1 0x02, PUSH1 0x00, PUSH1 0x00, APPROVE(0xaa)
+	timestampThenApproveCode = []byte{0x42, 0x60, 0x02, 0x60, 0x00, 0x60, 0x00, 0xaa}
+
+	// GAS, ADD (OP-012 violation), then APPROVE(0x2):
+	// GAS(0x5a), PUSH1 0x00, ADD(0x01), POP(0x50), PUSH1 0x02, PUSH1 0x00, PUSH1 0x00, APPROVE(0xaa)
+	gasAddThenApproveCode = []byte{0x5a, 0x60, 0x00, 0x01, 0x50, 0x60, 0x02, 0x60, 0x00, 0x60, 0x00, 0xaa}
+
+	// BALANCE (OP-080 violation) then APPROVE(0x2):
+	// PUSH20 <addr>, BALANCE(0x31), POP, APPROVE(0x2)
+	// PUSH20 0x00..00, BALANCE, POP, PUSH1 0x02, PUSH1 0x00, PUSH1 0x00, APPROVE
+	balanceThenApproveCode = append(
+		append([]byte{0x73}, make([]byte, 20)...), // PUSH20 0x00..00
+		0x31, 0x50, 0x60, 0x02, 0x60, 0x00, 0x60, 0x00, 0xaa,
+	)
+)
+
+func newTestEnv() (*FramePool, *state.StateDB, *params.ChainConfig) {
+	config := params.MergedTestChainConfig
+	statedb, _ := state.New(types.EmptyRootHash, state.NewDatabaseForTesting())
+
+	head := &types.Header{
+		Number:     big.NewInt(1),
+		GasLimit:   30_000_000,
+		BaseFee:    big.NewInt(params.InitialBaseFee),
+		Difficulty: big.NewInt(0),
+		Time:       0,
+	}
+
+	chain := &testChain{
+		config:  config,
+		statedb: statedb,
+		head:    head,
+	}
+
+	pool := New(chain)
+	pool.Init(0, head, newReserver())
+	return pool, statedb, config
+}
+
+// makeFrameTx creates a wrapped *types.Transaction from a FrameTx.
+func makeFrameTx(ftx *types.FrameTx) *types.Transaction {
+	return types.NewTx(ftx)
+}
+
+// baseFTX returns a valid FrameTx skeleton for the given sender.
+func baseFTX(sender common.Address, nonce uint64, config *params.ChainConfig) *types.FrameTx {
+	return &types.FrameTx{
+		ChainID:    uint256.NewInt(config.ChainID.Uint64()),
+		Nonce:      nonce,
+		Sender:     sender,
+		GasTipCap:  uint256.NewInt(1),
+		GasFeeCap:  uint256.NewInt(uint64(params.InitialBaseFee)),
+		BlobFeeCap: new(uint256.Int),
+	}
+}
+
+// --- Tests ---
+
+func TestFramePoolFilter(t *testing.T) {
+	pool, _, _ := newTestEnv()
+
+	// Frame tx should be accepted.
+	ftx := &types.FrameTx{
+		ChainID:    uint256.NewInt(1),
+		GasTipCap:  uint256.NewInt(0),
+		GasFeeCap:  uint256.NewInt(0),
+		BlobFeeCap: new(uint256.Int),
+		Frames:     []types.Frame{{Mode: types.FrameModeVerify, GasLimit: 50000}},
+	}
+	if !pool.Filter(makeFrameTx(ftx)) {
+		t.Fatal("expected Filter to accept FrameTxType")
+	}
+
+	// Legacy tx should be rejected.
+	legacy := types.NewTx(&types.LegacyTx{Nonce: 0, Gas: 21000, GasPrice: big.NewInt(1)})
+	if pool.Filter(legacy) {
+		t.Fatal("expected Filter to reject LegacyTxType")
+	}
+}
+
+func TestFramePoolValidFrameTx(t *testing.T) {
+	pool, statedb, config := newTestEnv()
+
+	sender := common.HexToAddress("0x1111111111111111111111111111111111111111")
+	statedb.CreateAccount(sender)
+	statedb.SetCode(sender, approveBothCode, tracing.CodeChangeUnspecified)
+	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
+
+	ftx := baseFTX(sender, 0, config)
+	ftx.Frames = []types.Frame{
+		{Mode: types.FrameModeVerify, Target: nil, GasLimit: 50000, Data: []byte{0x01}},
+	}
+
+	errs := pool.Add([]*types.Transaction{makeFrameTx(ftx)}, false)
+	if errs[0] != nil {
+		t.Fatalf("expected valid frame tx to be accepted, got: %v", errs[0])
+	}
+
+	// Should be in pool.
+	if pending, _ := pool.Stats(); pending != 1 {
+		t.Fatalf("expected 1 pending, got %d", pending)
+	}
+}
+
+func TestFramePoolBannedOpcode(t *testing.T) {
+	pool, statedb, config := newTestEnv()
+
+	sender := common.HexToAddress("0x1111111111111111111111111111111111111111")
+	statedb.CreateAccount(sender)
+	statedb.SetCode(sender, timestampThenApproveCode, tracing.CodeChangeUnspecified)
+	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
+
+	ftx := baseFTX(sender, 0, config)
+	ftx.Frames = []types.Frame{
+		{Mode: types.FrameModeVerify, Target: nil, GasLimit: 50000, Data: []byte{0x01}},
+	}
+
+	errs := pool.Add([]*types.Transaction{makeFrameTx(ftx)}, false)
+	if errs[0] == nil {
+		t.Fatal("expected rejection for banned opcode TIMESTAMP")
+	}
+	t.Logf("correctly rejected: %v", errs[0])
+}
+
+func TestFramePoolGasRule(t *testing.T) {
+	pool, statedb, config := newTestEnv()
+
+	sender := common.HexToAddress("0x1111111111111111111111111111111111111111")
+	statedb.CreateAccount(sender)
+	statedb.SetCode(sender, gasAddThenApproveCode, tracing.CodeChangeUnspecified)
+	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
+
+	ftx := baseFTX(sender, 0, config)
+	ftx.Frames = []types.Frame{
+		{Mode: types.FrameModeVerify, Target: nil, GasLimit: 50000, Data: []byte{0x01}},
+	}
+
+	errs := pool.Add([]*types.Transaction{makeFrameTx(ftx)}, false)
+	if errs[0] == nil {
+		t.Fatal("expected rejection for GAS not followed by CALL (OP-012)")
+	}
+	t.Logf("correctly rejected: %v", errs[0])
+}
+
+func TestFramePoolBalanceBanned(t *testing.T) {
+	pool, statedb, config := newTestEnv()
+
+	sender := common.HexToAddress("0x1111111111111111111111111111111111111111")
+	statedb.CreateAccount(sender)
+	statedb.SetCode(sender, balanceThenApproveCode, tracing.CodeChangeUnspecified)
+	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
+
+	ftx := baseFTX(sender, 0, config)
+	ftx.Frames = []types.Frame{
+		{Mode: types.FrameModeVerify, Target: nil, GasLimit: 50000, Data: []byte{0x01}},
+	}
+
+	errs := pool.Add([]*types.Transaction{makeFrameTx(ftx)}, false)
+	if errs[0] == nil {
+		t.Fatal("expected rejection for BALANCE opcode (OP-080)")
+	}
+	t.Logf("correctly rejected: %v", errs[0])
+}
+
+func TestFramePoolNoApprove(t *testing.T) {
+	pool, statedb, config := newTestEnv()
+
+	sender := common.HexToAddress("0x1111111111111111111111111111111111111111")
+	statedb.CreateAccount(sender)
+	statedb.SetCode(sender, returnCode, tracing.CodeChangeUnspecified)
+	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
+
+	ftx := baseFTX(sender, 0, config)
+	ftx.Frames = []types.Frame{
+		{Mode: types.FrameModeVerify, Target: nil, GasLimit: 50000, Data: []byte{0x01}},
+	}
+
+	errs := pool.Add([]*types.Transaction{makeFrameTx(ftx)}, false)
+	if errs[0] == nil {
+		t.Fatal("expected rejection for VERIFY frame without APPROVE")
+	}
+	t.Logf("correctly rejected: %v", errs[0])
+}
+
+func TestFramePoolGasCap(t *testing.T) {
+	pool, statedb, config := newTestEnv()
+
+	sender := common.HexToAddress("0x1111111111111111111111111111111111111111")
+	statedb.CreateAccount(sender)
+	statedb.SetCode(sender, approveBothCode, tracing.CodeChangeUnspecified)
+	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
+
+	ftx := baseFTX(sender, 0, config)
+	ftx.Frames = []types.Frame{
+		{Mode: types.FrameModeVerify, Target: nil, GasLimit: verifyFrameGasCap + 1, Data: []byte{0x01}},
+	}
+
+	errs := pool.Add([]*types.Transaction{makeFrameTx(ftx)}, false)
+	if errs[0] == nil {
+		t.Fatal("expected rejection for VERIFY frame exceeding gas cap")
+	}
+	t.Logf("correctly rejected: %v", errs[0])
+}
+
+func TestFramePoolSenderLimit(t *testing.T) {
+	pool, statedb, config := newTestEnv()
+
+	sender := common.HexToAddress("0x1111111111111111111111111111111111111111")
+	statedb.CreateAccount(sender)
+	statedb.SetCode(sender, approveBothCode, tracing.CodeChangeUnspecified)
+	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
+
+	// Add maxFrameTxsPerAccount txs — all should succeed.
+	for i := uint64(0); i < maxFrameTxsPerAccount; i++ {
+		ftx := baseFTX(sender, i, config)
+		ftx.Frames = []types.Frame{
+			{Mode: types.FrameModeVerify, Target: nil, GasLimit: 50000, Data: []byte{byte(i)}},
+		}
+		errs := pool.Add([]*types.Transaction{makeFrameTx(ftx)}, false)
+		if errs[0] != nil {
+			t.Fatalf("tx %d: unexpected error: %v", i, errs[0])
+		}
+	}
+
+	// The next one should be rejected.
+	ftx := baseFTX(sender, maxFrameTxsPerAccount, config)
+	ftx.Frames = []types.Frame{
+		{Mode: types.FrameModeVerify, Target: nil, GasLimit: 50000, Data: []byte{0xff}},
+	}
+	errs := pool.Add([]*types.Transaction{makeFrameTx(ftx)}, false)
+	if errs[0] == nil {
+		t.Fatal("expected rejection when exceeding per-sender limit")
+	}
+	t.Logf("correctly rejected: %v", errs[0])
+
+	if pending, _ := pool.Stats(); pending != maxFrameTxsPerAccount {
+		t.Fatalf("expected %d pending, got %d", maxFrameTxsPerAccount, pending)
+	}
+}
+
+func TestFramePoolNonceCheck(t *testing.T) {
+	pool, statedb, config := newTestEnv()
+
+	sender := common.HexToAddress("0x1111111111111111111111111111111111111111")
+	statedb.CreateAccount(sender)
+	statedb.SetCode(sender, approveBothCode, tracing.CodeChangeUnspecified)
+	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
+	statedb.SetNonce(sender, 5, tracing.NonceChangeUnspecified)
+
+	// Nonce too low.
+	ftx := baseFTX(sender, 4, config)
+	ftx.Frames = []types.Frame{
+		{Mode: types.FrameModeVerify, Target: nil, GasLimit: 50000, Data: []byte{0x01}},
+	}
+	errs := pool.Add([]*types.Transaction{makeFrameTx(ftx)}, false)
+	if errs[0] == nil {
+		t.Fatal("expected rejection for nonce too low")
+	}
+	t.Logf("correctly rejected: %v", errs[0])
+}
+
+func TestFramePoolDefaultFrameSkipsValidation(t *testing.T) {
+	pool, statedb, config := newTestEnv()
+
+	sender := common.HexToAddress("0x1111111111111111111111111111111111111111")
+	target := common.HexToAddress("0x2222222222222222222222222222222222222222")
+	statedb.CreateAccount(sender)
+	statedb.SetCode(sender, approveBothCode, tracing.CodeChangeUnspecified)
+	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
+
+	// Target uses TIMESTAMP — would fail VERIFY validation but should be fine in DEFAULT mode.
+	statedb.CreateAccount(target)
+	statedb.SetCode(target, timestampThenApproveCode, tracing.CodeChangeUnspecified)
+
+	ftx := baseFTX(sender, 0, config)
+	ftx.Frames = []types.Frame{
+		{Mode: types.FrameModeVerify, Target: nil, GasLimit: 50000, Data: []byte{0x01}},    // VERIFY on sender (valid)
+		{Mode: types.FrameModeDefault, Target: &target, GasLimit: 50000, Data: []byte{0x01}}, // DEFAULT on target (not validated)
+	}
+
+	errs := pool.Add([]*types.Transaction{makeFrameTx(ftx)}, false)
+	if errs[0] != nil {
+		t.Fatalf("expected acceptance (DEFAULT frames skip validation), got: %v", errs[0])
+	}
+}
+
+func TestFramePoolClear(t *testing.T) {
+	pool, statedb, config := newTestEnv()
+
+	sender := common.HexToAddress("0x1111111111111111111111111111111111111111")
+	statedb.CreateAccount(sender)
+	statedb.SetCode(sender, approveBothCode, tracing.CodeChangeUnspecified)
+	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
+
+	ftx := baseFTX(sender, 0, config)
+	ftx.Frames = []types.Frame{
+		{Mode: types.FrameModeVerify, Target: nil, GasLimit: 50000, Data: []byte{0x01}},
+	}
+	pool.Add([]*types.Transaction{makeFrameTx(ftx)}, false)
+
+	pool.Clear()
+
+	if pending, _ := pool.Stats(); pending != 0 {
+		t.Fatalf("expected 0 pending after Clear, got %d", pending)
+	}
+}
