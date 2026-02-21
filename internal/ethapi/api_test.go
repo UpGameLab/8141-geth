@@ -118,6 +118,60 @@ func TestTransactionBlobTx(t *testing.T) {
 	testTransactionMarshal(t, tests, &config)
 }
 
+func TestNewRPCTransactionFrameTx(t *testing.T) {
+	t.Parallel()
+
+	config := params.AllEthashProtocolChanges
+	target := common.HexToAddress("0x1234")
+	ftx := &types.FrameTx{
+		ChainID:    uint256.MustFromBig(config.ChainID),
+		Nonce:      7,
+		Sender:     common.HexToAddress("0xabcd"),
+		Frames:     []types.Frame{{Mode: types.FrameModeVerify, Target: nil, GasLimit: 50_000, Data: []byte("sig")}, {Mode: types.FrameModeSender, Target: &target, GasLimit: 80_000, Data: []byte("call")}},
+		GasTipCap:  uint256.NewInt(2),
+		GasFeeCap:  uint256.NewInt(100),
+		BlobFeeCap: uint256.NewInt(3),
+		BlobHashes: []common.Hash{{0x01}},
+	}
+	tx := types.NewTx(ftx)
+
+	// Pending encoding: gasPrice should be gasFeeCap.
+	pending := newRPCTransaction(tx, common.Hash{}, 0, 0, 0, big.NewInt(10), config)
+	if pending.Type != hexutil.Uint64(types.FrameTxType) {
+		t.Fatalf("type mismatch: got %d want %d", pending.Type, types.FrameTxType)
+	}
+	if pending.ChainID == nil || (*big.Int)(pending.ChainID).Cmp(config.ChainID) != 0 {
+		t.Fatalf("chainId mismatch: got %v want %v", pending.ChainID, config.ChainID)
+	}
+	if pending.GasFeeCap == nil || (*big.Int)(pending.GasFeeCap).Cmp(big.NewInt(100)) != 0 {
+		t.Fatalf("maxFeePerGas mismatch: got %v want 100", pending.GasFeeCap)
+	}
+	if pending.GasTipCap == nil || (*big.Int)(pending.GasTipCap).Cmp(big.NewInt(2)) != 0 {
+		t.Fatalf("maxPriorityFeePerGas mismatch: got %v want 2", pending.GasTipCap)
+	}
+	if pending.GasPrice == nil || (*big.Int)(pending.GasPrice).Cmp(big.NewInt(100)) != 0 {
+		t.Fatalf("gasPrice mismatch for pending tx: got %v want 100", pending.GasPrice)
+	}
+	if pending.MaxFeePerBlobGas == nil || (*big.Int)(pending.MaxFeePerBlobGas).Cmp(big.NewInt(3)) != 0 {
+		t.Fatalf("maxFeePerBlobGas mismatch: got %v want 3", pending.MaxFeePerBlobGas)
+	}
+	if len(pending.BlobVersionedHashes) != 1 {
+		t.Fatalf("blobVersionedHashes length mismatch: got %d want 1", len(pending.BlobVersionedHashes))
+	}
+	if len(pending.Frames) != 2 {
+		t.Fatalf("frames length mismatch: got %d want 2", len(pending.Frames))
+	}
+	if pending.Frames[0].Mode != types.FrameModeVerify || pending.Frames[1].Mode != types.FrameModeSender {
+		t.Fatalf("unexpected frame modes: %#v", pending.Frames)
+	}
+
+	// Mined encoding: gasPrice should be min(tip+baseFee, feeCap) = min(2+10,100)=12.
+	mined := newRPCTransaction(tx, common.HexToHash("0x1"), 1, 0, 0, big.NewInt(10), config)
+	if mined.GasPrice == nil || (*big.Int)(mined.GasPrice).Cmp(big.NewInt(12)) != 0 {
+		t.Fatalf("gasPrice mismatch for mined tx: got %v want 12", mined.GasPrice)
+	}
+}
+
 type txData struct {
 	Tx   types.TxData
 	Want string

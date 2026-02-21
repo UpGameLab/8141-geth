@@ -999,6 +999,7 @@ type RPCTransaction struct {
 	ChainID             *hexutil.Big                 `json:"chainId,omitempty"`
 	BlobVersionedHashes []common.Hash                `json:"blobVersionedHashes,omitempty"`
 	AuthorizationList   []types.SetCodeAuthorization `json:"authorizationList,omitempty"`
+	Frames              []types.Frame                `json:"frames,omitempty"`
 	V                   *hexutil.Big                 `json:"v"`
 	R                   *hexutil.Big                 `json:"r"`
 	S                   *hexutil.Big                 `json:"s"`
@@ -1093,6 +1094,19 @@ func newRPCTransaction(tx *types.Transaction, blockHash common.Hash, blockNumber
 			result.GasPrice = (*hexutil.Big)(tx.GasFeeCap())
 		}
 		result.AuthorizationList = tx.SetCodeAuthorizations()
+
+	case types.FrameTxType:
+		result.ChainID = (*hexutil.Big)(tx.ChainId())
+		result.GasFeeCap = (*hexutil.Big)(tx.GasFeeCap())
+		result.GasTipCap = (*hexutil.Big)(tx.GasTipCap())
+		if baseFee != nil && blockHash != (common.Hash{}) {
+			result.GasPrice = (*hexutil.Big)(effectiveGasPrice(tx, baseFee))
+		} else {
+			result.GasPrice = (*hexutil.Big)(tx.GasFeeCap())
+		}
+		result.MaxFeePerBlobGas = (*hexutil.Big)(tx.BlobGasFeeCap())
+		result.BlobVersionedHashes = tx.BlobHashes()
+		result.Frames = tx.Frames()
 	}
 	return result
 }
