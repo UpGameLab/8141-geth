@@ -17,6 +17,8 @@
 package core
 
 import (
+	"errors"
+	"math"
 	"math/big"
 	"testing"
 
@@ -709,5 +711,70 @@ func TestFrameTxTxParamLoad(t *testing.T) {
 	got = statedb.GetState(target, common.BytesToHash([]byte{0x02}))
 	if got != senderHash {
 		t.Fatalf("TXPARAMLOAD sender: got %v, want %v", got, senderHash)
+	}
+}
+
+// TestFrameTxFrameGasSumOverflow verifies that executeFrameTx detects when the sum
+// of per-frame gas limits overflows uint64 and returns ErrFrameTxInvalid.
+func TestFrameTxFrameGasSumOverflow(t *testing.T) {
+	evm, _, _ := newFrameTestEnv()
+
+	sender := common.HexToAddress("0xaaaa")
+	// Frame 1: MaxUint64 - 100. Frame 2: 200. Sum = MaxUint64 - 100 + 200 overflows.
+	msg := &Message{
+		From:      sender,
+		GasLimit:  100_000,
+		GasFeeCap: new(big.Int),
+		GasTipCap: new(big.Int),
+		GasPrice:  new(big.Int),
+		Value:     new(big.Int),
+		// SkipTransactionChecks bypasses fee + Osaka-cap checks so we reach
+		// the frame-gas-sum check regardless of fee parameters.
+		SkipNonceChecks:       true,
+		SkipTransactionChecks: true,
+		Frames: []types.Frame{
+			{Mode: types.FrameModeDefault, GasLimit: math.MaxUint64 - 100},
+			{Mode: types.FrameModeDefault, GasLimit: 200},
+		},
+	}
+
+	_, err := applyFrameTx(evm, nil, msg)
+	if err == nil {
+		t.Fatal("expected error for frame gas sum overflow, got nil")
+	}
+	if !errors.Is(err, ErrFrameTxInvalid) {
+		t.Errorf("expected ErrFrameTxInvalid, got: %v", err)
+	}
+}
+
+// TestFrameTxOsakaGasCap verifies that executeFrameTx enforces the EIP-7825
+// per-transaction gas limit cap (params.MaxTxGas) when Osaka is active.
+func TestFrameTxOsakaGasCap(t *testing.T) {
+	// MergedTestChainConfig has OsakaTime=0, so Osaka is always active.
+	evm, _, _ := newFrameTestEnv()
+
+	sender := common.HexToAddress("0xbbbb")
+	// Construct a message whose GasLimit exceeds MaxTxGas.
+	// GasFeeCap must be >= BaseFee (params.InitialBaseFee) to pass London check.
+	msg := &Message{
+		From:            sender,
+		GasLimit:        params.MaxTxGas + 1,
+		GasFeeCap:       big.NewInt(params.InitialBaseFee),
+		GasTipCap:       new(big.Int),
+		GasPrice:        big.NewInt(params.InitialBaseFee),
+		BlobGasFeeCap:   new(big.Int),
+		Value:           new(big.Int),
+		SkipNonceChecks: true,
+		Frames: []types.Frame{
+			{Mode: types.FrameModeDefault, GasLimit: params.MaxTxGas},
+		},
+	}
+
+	_, err := applyFrameTx(evm, nil, msg)
+	if err == nil {
+		t.Fatal("expected ErrGasLimitTooHigh for Osaka gas cap, got nil")
+	}
+	if !errors.Is(err, ErrGasLimitTooHigh) {
+		t.Errorf("expected ErrGasLimitTooHigh, got: %v", err)
 	}
 }

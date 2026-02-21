@@ -18,6 +18,8 @@ package types
 
 import (
 	"bytes"
+	"math"
+	"strings"
 	"testing"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -314,5 +316,180 @@ func TestFrameTxSigner(t *testing.T) {
 	}
 	if r.Sign() != 0 || s.Sign() != 0 || v.Sign() != 0 {
 		t.Error("SignatureValues should return zeros for frame tx")
+	}
+}
+
+func TestFrameDecodeRLPRejectsInvalidTargetLength(t *testing.T) {
+	tests := []int{1, common.AddressLength - 1, common.AddressLength + 1, 32}
+	for _, n := range tests {
+		payload, err := rlp.EncodeToBytes([]any{
+			uint8(FrameModeDefault),
+			bytes.Repeat([]byte{0x11}, n),
+			uint64(1),
+			[]byte{0x01},
+		})
+		if err != nil {
+			t.Fatalf("failed to encode frame with target len %d: %v", n, err)
+		}
+		var frame Frame
+		err = rlp.DecodeBytes(payload, &frame)
+		if err == nil {
+			t.Fatalf("expected decode error for target len %d, got nil", n)
+		}
+		if !strings.Contains(err.Error(), "invalid frame target length") {
+			t.Fatalf("unexpected error for target len %d: %v", n, err)
+		}
+	}
+}
+
+func TestFrameDecodeRLPResetsNilTarget(t *testing.T) {
+	target := common.HexToAddress("0x1234567890abcdef1234567890abcdef12345678")
+	frame := Frame{Target: &target}
+
+	payload, err := rlp.EncodeToBytes([]any{
+		uint8(FrameModeVerify),
+		[]byte{},
+		uint64(100),
+		[]byte("sig"),
+	})
+	if err != nil {
+		t.Fatalf("failed to encode frame payload: %v", err)
+	}
+	if err := rlp.DecodeBytes(payload, &frame); err != nil {
+		t.Fatalf("failed to decode frame payload: %v", err)
+	}
+	if frame.Target != nil {
+		t.Fatalf("expected nil target, got %v", *frame.Target)
+	}
+}
+
+// TestFrameTxTotalGasOverflow verifies that TotalGas() clamps to math.MaxUint64
+// rather than wrapping around when the sum of frame gas limits overflows uint64.
+func TestFrameTxTotalGasOverflow(t *testing.T) {
+	// Frame 1: MaxUint64 - 100, Frame 2: 200 → sum overflows uint64.
+	ftx := &FrameTx{
+		ChainID:    uint256.NewInt(1),
+		Sender:     common.Address{},
+		GasTipCap:  uint256.NewInt(0),
+		GasFeeCap:  uint256.NewInt(0),
+		BlobFeeCap: uint256.NewInt(0),
+		Frames: []Frame{
+			{Mode: FrameModeDefault, GasLimit: math.MaxUint64 - 100},
+			{Mode: FrameModeDefault, GasLimit: 200},
+		},
+	}
+	if got := ftx.TotalGas(); got != math.MaxUint64 {
+		t.Errorf("TotalGas() with overflow = %d, want math.MaxUint64 (%d)", got, uint64(math.MaxUint64))
+	}
+}
+
+// TestFrameTxCalldataGas verifies CalldataGas() returns (uint64, nil) on normal input
+// and that the gas value is proportional to the frame data size.
+func TestFrameTxCalldataGas(t *testing.T) {
+	// Normal tx with frame data: should return a positive gas value with no error.
+	ftx := testFrameTx()
+	gas, err := ftx.CalldataGas()
+	if err != nil {
+		t.Fatalf("CalldataGas() unexpected error: %v", err)
+	}
+	if gas == 0 {
+		t.Error("CalldataGas() returned 0 for a tx with non-empty frame data")
+	}
+
+	// Empty frames list: should still return (value, nil).
+	ftxEmpty := &FrameTx{
+		ChainID:    uint256.NewInt(1),
+		Sender:     common.Address{},
+		GasTipCap:  uint256.NewInt(0),
+		GasFeeCap:  uint256.NewInt(0),
+		BlobFeeCap: uint256.NewInt(0),
+	}
+	gasEmpty, err := ftxEmpty.CalldataGas()
+	if err != nil {
+		t.Fatalf("CalldataGas() for empty frames unexpected error: %v", err)
+	}
+	// Empty frame list RLP is minimal; gas from non-empty frames should be higher.
+	if gasEmpty >= gas {
+		t.Errorf("empty frames CalldataGas %d should be < non-empty frames CalldataGas %d", gasEmpty, gas)
+	}
+}
+
+// TestFrameTxFloorDataGas verifies FloorDataGas() returns (uint64, nil) on normal input
+// and that the result is at least TxGasEIP8141.
+func TestFrameTxFloorDataGas(t *testing.T) {
+	ftx := testFrameTx()
+	floor, err := ftx.FloorDataGas()
+	if err != nil {
+		t.Fatalf("FloorDataGas() unexpected error: %v", err)
+	}
+	if floor < uint64(params.TxGasEIP8141) {
+		t.Errorf("FloorDataGas() = %d, want >= TxGasEIP8141 (%d)", floor, params.TxGasEIP8141)
+	}
+
+	// Empty frames: floor = TxGasEIP8141 + cost of minimal RLP list.
+	ftxEmpty := &FrameTx{
+		ChainID:    uint256.NewInt(1),
+		Sender:     common.Address{},
+		GasTipCap:  uint256.NewInt(0),
+		GasFeeCap:  uint256.NewInt(0),
+		BlobFeeCap: uint256.NewInt(0),
+	}
+	floorEmpty, err := ftxEmpty.FloorDataGas()
+	if err != nil {
+		t.Fatalf("FloorDataGas() for empty frames unexpected error: %v", err)
+	}
+	if floorEmpty < uint64(params.TxGasEIP8141) {
+		t.Errorf("FloorDataGas() empty = %d, want >= TxGasEIP8141 (%d)", floorEmpty, params.TxGasEIP8141)
+	}
+}
+
+func TestFrameTxUnmarshalBinaryRejectsInvalidTargetLength(t *testing.T) {
+	type rawFrame struct {
+		Mode     uint8
+		Target   []byte
+		GasLimit uint64
+		Data     []byte
+	}
+	type rawFrameTx struct {
+		ChainID    *uint256.Int
+		Nonce      uint64
+		Sender     common.Address
+		Frames     []rawFrame
+		GasTipCap  *uint256.Int
+		GasFeeCap  *uint256.Int
+		BlobFeeCap *uint256.Int
+		BlobHashes []common.Hash
+	}
+
+	raw := rawFrameTx{
+		ChainID: uint256.NewInt(1),
+		Nonce:   1,
+		Sender:  common.HexToAddress("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+		Frames: []rawFrame{
+			{
+				Mode:     FrameModeVerify,
+				Target:   bytes.Repeat([]byte{0x01}, common.AddressLength-1),
+				GasLimit: 100000,
+				Data:     []byte("signature"),
+			},
+		},
+		GasTipCap:  uint256.NewInt(1),
+		GasFeeCap:  uint256.NewInt(1),
+		BlobFeeCap: uint256.NewInt(0),
+		BlobHashes: nil,
+	}
+	payload, err := rlp.EncodeToBytes(raw)
+	if err != nil {
+		t.Fatalf("failed to encode malformed frame tx: %v", err)
+	}
+	rawTx := append([]byte{FrameTxType}, payload...)
+
+	var tx Transaction
+	err = tx.UnmarshalBinary(rawTx)
+	if err == nil {
+		t.Fatal("expected UnmarshalBinary to fail for invalid frame target length")
+	}
+	if !strings.Contains(err.Error(), "invalid frame target length") {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }

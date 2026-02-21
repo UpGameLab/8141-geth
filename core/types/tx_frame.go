@@ -18,7 +18,10 @@ package types
 
 import (
 	"bytes"
+	"errors"
+	"fmt"
 	"io"
+	"math"
 	"math/big"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -26,6 +29,9 @@ import (
 	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/holiman/uint256"
 )
+
+// errFrameGasUintOverflow is returned when a gas calculation overflows uint64.
+var errFrameGasUintOverflow = errors.New("gas uint64 overflow")
 
 // Frame mode constants as defined in EIP-8141.
 const (
@@ -69,7 +75,11 @@ func (f *Frame) DecodeRLP(s *rlp.Stream) error {
 	f.Mode = dec.Mode
 	f.GasLimit = dec.GasLimit
 	f.Data = dec.Data
+	f.Target = nil
 	if len(dec.Target) > 0 {
+		if len(dec.Target) != common.AddressLength {
+			return fmt.Errorf("invalid frame target length %d", len(dec.Target))
+		}
 		addr := common.BytesToAddress(dec.Target)
 		f.Target = &addr
 	}
@@ -97,9 +107,14 @@ type FrameTx struct {
 // EIP-8141: FRAME_TX_INTRINSIC_COST + calldata_cost(rlp(frames)) + sum(frame.gas_limit).
 // The calldata cost is not included here as it requires the encoded frame data;
 // this method returns the sum of frame gas limits plus intrinsic cost.
+// On overflow, math.MaxUint64 is returned; callers relying on this value for
+// gas pool or block limit checks will reject the transaction appropriately.
 func (tx *FrameTx) TotalGas() uint64 {
 	total := uint64(params.TxGasEIP8141)
 	for _, f := range tx.Frames {
+		if f.GasLimit > math.MaxUint64-total {
+			return math.MaxUint64
+		}
 		total += f.GasLimit
 	}
 	return total
@@ -148,7 +163,7 @@ func (tx *FrameTx) copy() TxData {
 // accessors for innerTx.
 func (tx *FrameTx) txType() byte           { return FrameTxType }
 func (tx *FrameTx) chainID() *big.Int      { return tx.ChainID.ToBig() }
-func (tx *FrameTx) accessList() AccessList  { return nil }
+func (tx *FrameTx) accessList() AccessList { return nil }
 func (tx *FrameTx) data() []byte           { return nil }
 func (tx *FrameTx) gas() uint64            { return tx.TotalGas() }
 func (tx *FrameTx) gasFeeCap() *big.Int    { return tx.GasFeeCap.ToBig() }
@@ -197,21 +212,44 @@ func (tx *FrameTx) rlpFramesData() []byte {
 
 // CalldataGas returns the calldata cost of the RLP-encoded frames.
 // Per EIP-8141: calldata_cost(rlp(tx.frames)) using EIP-2028 gas costs.
-func (tx *FrameTx) CalldataGas() uint64 {
+// Returns errFrameGasUintOverflow if the result would exceed uint64.
+func (tx *FrameTx) CalldataGas() (uint64, error) {
 	data := tx.rlpFramesData()
 	z := uint64(bytes.Count(data, []byte{0}))
 	nz := uint64(len(data)) - z
-	return z*params.TxDataZeroGas + nz*params.TxDataNonZeroGasEIP2028
+	if nz > 0 && (math.MaxUint64/params.TxDataNonZeroGasEIP2028) < nz {
+		return 0, errFrameGasUintOverflow
+	}
+	nzGas := nz * params.TxDataNonZeroGasEIP2028
+	if z > 0 && (math.MaxUint64-nzGas)/params.TxDataZeroGas < z {
+		return 0, errFrameGasUintOverflow
+	}
+	return nzGas + z*params.TxDataZeroGas, nil
 }
 
 // FloorDataGas returns the EIP-7623 floor data gas for a frame transaction.
 // floor = TxGasEIP8141 + tokens * TxCostFloorPerToken
-func (tx *FrameTx) FloorDataGas() uint64 {
+// Returns errFrameGasUintOverflow if the result would exceed uint64.
+func (tx *FrameTx) FloorDataGas() (uint64, error) {
 	data := tx.rlpFramesData()
 	z := uint64(bytes.Count(data, []byte{0}))
 	nz := uint64(len(data)) - z
-	tokens := nz*params.TxTokenPerNonZeroByte + z
-	return params.TxGasEIP8141 + tokens*params.TxCostFloorPerToken
+	if nz > 0 && (math.MaxUint64/params.TxTokenPerNonZeroByte) < nz {
+		return 0, errFrameGasUintOverflow
+	}
+	nzTokens := nz * params.TxTokenPerNonZeroByte
+	if z > math.MaxUint64-nzTokens {
+		return 0, errFrameGasUintOverflow
+	}
+	tokens := nzTokens + z
+	if tokens > 0 && (math.MaxUint64/params.TxCostFloorPerToken) < tokens {
+		return 0, errFrameGasUintOverflow
+	}
+	floorGas := tokens * params.TxCostFloorPerToken
+	if floorGas > math.MaxUint64-params.TxGasEIP8141 {
+		return 0, errFrameGasUintOverflow
+	}
+	return params.TxGasEIP8141 + floorGas, nil
 }
 
 // SigHash returns the exported signature hash for the frame transaction.

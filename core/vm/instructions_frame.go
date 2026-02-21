@@ -177,10 +177,10 @@ func getTxParam(evm *EVM, in1, in2 uint64) ([]byte, error) {
 		return bytes32(v), nil
 
 	case txParamFrameTarget:
-		idx := int(in2)
-		if idx < 0 || idx >= len(fc.Frames) {
+		if in2 >= uint64(len(fc.Frames)) {
 			return nil, &ErrInvalidOpCode{opcode: TXPARAMLOAD}
 		}
+		idx := int(in2)
 		var buf [32]byte
 		f := &fc.Frames[idx]
 		if f.Target != nil {
@@ -191,10 +191,10 @@ func getTxParam(evm *EVM, in1, in2 uint64) ([]byte, error) {
 		return buf[:], nil
 
 	case txParamFrameData:
-		idx := int(in2)
-		if idx < 0 || idx >= len(fc.Frames) {
+		if in2 >= uint64(len(fc.Frames)) {
 			return nil, &ErrInvalidOpCode{opcode: TXPARAMLOAD}
 		}
+		idx := int(in2)
 		f := &fc.Frames[idx]
 		// VERIFY frames return empty data.
 		if f.Mode == types.FrameModeVerify {
@@ -203,26 +203,24 @@ func getTxParam(evm *EVM, in1, in2 uint64) ([]byte, error) {
 		return f.Data, nil
 
 	case txParamFrameGas:
-		idx := int(in2)
-		if idx < 0 || idx >= len(fc.Frames) {
+		if in2 >= uint64(len(fc.Frames)) {
 			return nil, &ErrInvalidOpCode{opcode: TXPARAMLOAD}
 		}
-		v := new(uint256.Int).SetUint64(fc.Frames[idx].GasLimit)
+		v := new(uint256.Int).SetUint64(fc.Frames[int(in2)].GasLimit)
 		return bytes32(v), nil
 
 	case txParamFrameMode:
-		idx := int(in2)
-		if idx < 0 || idx >= len(fc.Frames) {
+		if in2 >= uint64(len(fc.Frames)) {
 			return nil, &ErrInvalidOpCode{opcode: TXPARAMLOAD}
 		}
-		v := new(uint256.Int).SetUint64(uint64(fc.Frames[idx].Mode))
+		v := new(uint256.Int).SetUint64(uint64(fc.Frames[int(in2)].Mode))
 		return bytes32(v), nil
 
 	case txParamFrameStatus:
-		idx := int(in2)
-		if idx < 0 || idx >= len(fc.Frames) {
+		if in2 >= uint64(len(fc.Frames)) {
 			return nil, &ErrInvalidOpCode{opcode: TXPARAMLOAD}
 		}
+		idx := int(in2)
 		// Cannot query current or future frame status.
 		if idx >= fc.FrameIndex {
 			return nil, &ErrInvalidOpCode{opcode: TXPARAMLOAD}
@@ -292,10 +290,15 @@ func opTxParamCopy(pc *uint64, evm *EVM, scope *ScopeContext) ([]byte, error) {
 	dataOff64 := dataOffset.Uint64()
 	len64 := length.Uint64()
 
-	// Build the padded copy.
-	end := dataOff64 + len64
-	if end > uint64(len(data)) {
+	// Build the padded copy. Guard against dataOff64+len64 overflowing uint64.
+	var end uint64
+	if dataOff64 > ^uint64(0)-len64 {
 		end = uint64(len(data))
+	} else {
+		end = dataOff64 + len64
+		if end > uint64(len(data)) {
+			end = uint64(len(data))
+		}
 	}
 	var padded []byte
 	if dataOff64 < uint64(len(data)) {

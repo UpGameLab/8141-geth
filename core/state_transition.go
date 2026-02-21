@@ -217,8 +217,16 @@ func TransactionToMessage(tx *types.Transaction, s types.Signer, baseFee *big.In
 	if ftx := tx.GetFrameTx(); ftx != nil {
 		msg.Frames = ftx.Frames
 		msg.FrameSigHash = ftx.SigHash(tx.ChainId())
-		msg.FrameFloorDataGas = ftx.FloorDataGas()
-		msg.GasLimit += ftx.CalldataGas()
+		floorDataGas, err := ftx.FloorDataGas()
+		if err != nil {
+			return nil, err
+		}
+		msg.FrameFloorDataGas = floorDataGas
+		calldataGas, err := ftx.CalldataGas()
+		if err != nil {
+			return nil, err
+		}
+		msg.GasLimit += calldataGas
 	}
 	var err error
 	msg.From, err = types.Sender(s, tx)
@@ -759,6 +767,13 @@ func (st *stateTransition) executeFrameTx() (*ExecutionResult, error) {
 				}
 			}
 		}
+		// EIP-7825: enforce per-transaction gas limit cap (Osaka+).
+		// msg.GasLimit for frame tx = TxGasEIP8141 + calldataGas + Σframe.GasLimit.
+		if st.evm.ChainConfig().IsOsaka(st.evm.Context.BlockNumber, st.evm.Context.Time) {
+			if msg.GasLimit > params.MaxTxGas {
+				return nil, fmt.Errorf("%w (cap: %d, tx: %d)", ErrGasLimitTooHigh, params.MaxTxGas, msg.GasLimit)
+			}
+		}
 		if blobGas := st.blobGasUsed(); blobGas > 0 {
 			skipCheck := st.evm.Config.NoBaseFee && msg.BlobGasFeeCap.BitLen() == 0
 			if !skipCheck {
@@ -787,7 +802,13 @@ func (st *stateTransition) executeFrameTx() (*ExecutionResult, error) {
 	//    intrinsicGas = total - sum(frame.gas_limit) = TxGasEIP8141 + calldataCost
 	var frameGasSum uint64
 	for _, f := range msg.Frames {
+		if f.GasLimit > math.MaxUint64-frameGasSum {
+			return nil, fmt.Errorf("%w: frame gas limits overflow uint64", ErrFrameTxInvalid)
+		}
 		frameGasSum += f.GasLimit
+	}
+	if msg.GasLimit < frameGasSum {
+		return nil, fmt.Errorf("%w: gas limit %d < frame gas sum %d", ErrFrameTxInvalid, msg.GasLimit, frameGasSum)
 	}
 	intrinsicGas := msg.GasLimit - frameGasSum
 	if st.gasRemaining < intrinsicGas {
