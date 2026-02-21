@@ -24,14 +24,17 @@ import (
 	"github.com/ethereum/go-ethereum/core/stateless"
 	"github.com/ethereum/go-ethereum/core/tracing"
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/trie/utils"
 	"github.com/holiman/uint256"
 )
 
-// mockStateDB implements StateDB; only GetCodeSize is meaningful for the tracer.
+// mockStateDB implements StateDB for tracer tests.
 type mockStateDB struct {
 	codeSize map[common.Address]int
+	state    map[common.Address]map[common.Hash]common.Hash // For GetState (STO-021)
+	exists   map[common.Address]bool                        // For Exist (STO-021)
 }
 
 func (m *mockStateDB) GetCodeSize(addr common.Address) int { return m.codeSize[addr] }
@@ -57,7 +60,14 @@ func (m *mockStateDB) GetRefund() uint64                                        
 func (m *mockStateDB) GetStateAndCommittedState(common.Address, common.Hash) (common.Hash, common.Hash) {
 	return common.Hash{}, common.Hash{}
 }
-func (m *mockStateDB) GetState(common.Address, common.Hash) common.Hash { return common.Hash{} }
+func (m *mockStateDB) GetState(addr common.Address, slot common.Hash) common.Hash {
+	if m.state != nil {
+		if slots, ok := m.state[addr]; ok {
+			return slots[slot]
+		}
+	}
+	return common.Hash{}
+}
 func (m *mockStateDB) SetState(common.Address, common.Hash, common.Hash) common.Hash {
 	return common.Hash{}
 }
@@ -70,7 +80,12 @@ func (m *mockStateDB) ResetTransientStorage()                                   
 func (m *mockStateDB) SelfDestruct(common.Address) uint256.Int                    { return uint256.Int{} }
 func (m *mockStateDB) HasSelfDestructed(common.Address) bool                       { return false }
 func (m *mockStateDB) SelfDestruct6780(common.Address) (uint256.Int, bool)        { return uint256.Int{}, false }
-func (m *mockStateDB) Exist(common.Address) bool                                   { return false }
+func (m *mockStateDB) Exist(addr common.Address) bool {
+	if m.exists != nil {
+		return m.exists[addr]
+	}
+	return false
+}
 func (m *mockStateDB) Empty(common.Address) bool                                   { return true }
 func (m *mockStateDB) AddressInAccessList(common.Address) bool                     { return false }
 func (m *mockStateDB) SlotInAccessList(common.Address, common.Hash) (bool, bool)   { return false, false }
@@ -90,13 +105,15 @@ func (m *mockStateDB) Finalise(bool)               {}
 
 // mockScope implements tracing.OpContext for tests.
 type mockScope struct {
-	stackData []uint256.Int
+	stackData  []uint256.Int
+	memoryData []byte         // For KECCAK256 preimage reads
+	address    common.Address // Contract address for SLOAD scope
 }
 
-func (s *mockScope) MemoryData() []byte       { return nil }
+func (s *mockScope) MemoryData() []byte       { return s.memoryData }
 func (s *mockScope) StackData() []uint256.Int { return s.stackData }
 func (s *mockScope) Caller() common.Address   { return common.Address{} }
-func (s *mockScope) Address() common.Address  { return common.Address{} }
+func (s *mockScope) Address() common.Address  { return s.address }
 func (s *mockScope) CallValue() *uint256.Int  { return new(uint256.Int) }
 func (s *mockScope) CallInput() []byte        { return nil }
 func (s *mockScope) ContractCode() []byte     { return nil }
@@ -359,5 +376,219 @@ func TestFrameValidationFailFast(t *testing.T) {
 	tracer.OnOpcode(1, byte(TIMESTAMP), 100000, 2, emptyScope(), nil, 1, nil)
 	if tracer.Violation() != first {
 		t.Fatal("violation should not change after first detection")
+	}
+}
+
+// --- STO-xxx storage access rule tests ---
+
+var (
+	testExternalContract = common.HexToAddress("0x4444444444444444444444444444444444444444")
+	testSlot             = common.HexToHash("0x01")
+)
+
+// newSTOTracer creates a tracer with configurable state and existence for STO tests.
+func newSTOTracer(state map[common.Address]map[common.Hash]common.Hash, exists map[common.Address]bool) *FrameValidationTracer {
+	db := &mockStateDB{
+		codeSize: map[common.Address]int{
+			testContract:         100,
+			testExternalContract: 100,
+		},
+		state:  state,
+		exists: exists,
+	}
+	return NewFrameValidationTracer(db, testSender, []common.Address{testPrecompile1})
+}
+
+// scopeForSload creates a scope for SLOAD: slot at stack top, with contract address.
+func scopeForSload(contractAddr common.Address, slot common.Hash) *mockScope {
+	slotVal := new(uint256.Int).SetBytes(slot.Bytes())
+	return &mockScope{
+		stackData: []uint256.Int{*slotVal},
+		address:   contractAddr,
+	}
+}
+
+// scopeForKeccak creates a scope for KECCAK256: offset=0, length on stack, data in memory.
+func scopeForKeccak(preimage []byte) *mockScope {
+	offset := uint256.NewInt(0)
+	length := uint256.NewInt(uint64(len(preimage)))
+	// Stack bottom→top: length, offset (KECCAK256 pops offset first, then length)
+	return &mockScope{
+		stackData:  []uint256.Int{*length, *offset},
+		memoryData: preimage,
+	}
+}
+
+// TestSTO010_SenderOwnStorage verifies sender's own storage is always allowed.
+func TestSTO010_SenderOwnStorage(t *testing.T) {
+	tracer := newSTOTracer(nil, map[common.Address]bool{testSender: true})
+	scope := scopeForSload(testSender, testSlot)
+	tracer.OnOpcode(0, byte(SLOAD), 100000, 200, scope, nil, 1, nil)
+	tracer.OnExit(1, nil, 50000, nil, false)
+	if v := tracer.Violation(); v != nil {
+		t.Fatalf("unexpected violation for sender own storage: %s", v)
+	}
+}
+
+// TestSTO021_SenderNotExist verifies external storage rejected when sender doesn't exist.
+func TestSTO021_SenderNotExist(t *testing.T) {
+	tracer := newSTOTracer(nil, nil) // sender does not exist
+	scope := scopeForSload(testExternalContract, testSlot)
+	tracer.OnOpcode(0, byte(SLOAD), 100000, 200, scope, nil, 1, nil)
+	tracer.OnExit(1, nil, 50000, nil, false)
+	v := tracer.Violation()
+	if v == nil {
+		t.Fatal("expected STO-021 violation")
+	}
+	if v.Rule != "STO-021" {
+		t.Fatalf("expected STO-021, got %s", v.Rule)
+	}
+}
+
+// TestSTO021_DirectValueMatch verifies associated storage via direct value match.
+func TestSTO021_DirectValueMatch(t *testing.T) {
+	// External contract's slot value equals the sender address.
+	senderHash := common.BytesToHash(testSender.Bytes())
+	tracer := newSTOTracer(
+		map[common.Address]map[common.Hash]common.Hash{
+			testExternalContract: {testSlot: senderHash},
+		},
+		map[common.Address]bool{testSender: true},
+	)
+	scope := scopeForSload(testExternalContract, testSlot)
+	tracer.OnOpcode(0, byte(SLOAD), 100000, 200, scope, nil, 1, nil)
+	tracer.OnExit(1, nil, 50000, nil, false)
+	if v := tracer.Violation(); v != nil {
+		t.Fatalf("unexpected violation: %s", v)
+	}
+}
+
+// TestSTO021_KeccakDerived verifies associated storage via keccak derivation.
+func TestSTO021_KeccakDerived(t *testing.T) {
+	// Simulate: mapping(address => uint256) at storage position 0x05
+	// Solidity computes: keccak256(abi.encode(sender, 0x05))
+	senderHash := common.BytesToHash(testSender.Bytes())
+	mappingSlot := common.BytesToHash([]byte{0x05})
+	preimage := make([]byte, 64)
+	copy(preimage[:32], senderHash[:])
+	copy(preimage[32:], mappingSlot[:])
+	derivedSlot := crypto.Keccak256Hash(preimage)
+
+	tracer := newSTOTracer(nil, map[common.Address]bool{testSender: true})
+
+	// First: KECCAK256 to record preimage.
+	tracer.OnOpcode(0, byte(KECCAK256), 100000, 30, scopeForKeccak(preimage), nil, 1, nil)
+	// Then: SLOAD on the derived slot.
+	tracer.OnOpcode(1, byte(SLOAD), 100000, 200, scopeForSload(testExternalContract, derivedSlot), nil, 1, nil)
+	tracer.OnExit(1, nil, 50000, nil, false)
+	if v := tracer.Violation(); v != nil {
+		t.Fatalf("unexpected violation: %s", v)
+	}
+}
+
+// TestSTO021_KeccakDerivedWithOffset verifies keccak + offset (struct in mapping).
+func TestSTO021_KeccakDerivedWithOffset(t *testing.T) {
+	senderHash := common.BytesToHash(testSender.Bytes())
+	mappingSlot := common.BytesToHash([]byte{0x05})
+	preimage := make([]byte, 64)
+	copy(preimage[:32], senderHash[:])
+	copy(preimage[32:], mappingSlot[:])
+	baseSlot := crypto.Keccak256Hash(preimage)
+
+	// Access slot = baseSlot + 3 (e.g., 4th field of a struct).
+	offsetSlot := common.BigToHash(new(uint256.Int).Add(
+		new(uint256.Int).SetBytes(baseSlot[:]),
+		uint256.NewInt(3),
+	).ToBig())
+
+	tracer := newSTOTracer(nil, map[common.Address]bool{testSender: true})
+	tracer.OnOpcode(0, byte(KECCAK256), 100000, 30, scopeForKeccak(preimage), nil, 1, nil)
+	tracer.OnOpcode(1, byte(SLOAD), 100000, 200, scopeForSload(testExternalContract, offsetSlot), nil, 1, nil)
+	tracer.OnExit(1, nil, 50000, nil, false)
+	if v := tracer.Violation(); v != nil {
+		t.Fatalf("unexpected violation for offset 3: %s", v)
+	}
+}
+
+// TestSTO021_KeccakOffsetExceeded verifies keccak + offset > 128 is rejected.
+func TestSTO021_KeccakOffsetExceeded(t *testing.T) {
+	senderHash := common.BytesToHash(testSender.Bytes())
+	mappingSlot := common.BytesToHash([]byte{0x05})
+	preimage := make([]byte, 64)
+	copy(preimage[:32], senderHash[:])
+	copy(preimage[32:], mappingSlot[:])
+	baseSlot := crypto.Keccak256Hash(preimage)
+
+	// Access slot = baseSlot + 129 (exceeds 128 limit).
+	offsetSlot := common.BigToHash(new(uint256.Int).Add(
+		new(uint256.Int).SetBytes(baseSlot[:]),
+		uint256.NewInt(129),
+	).ToBig())
+
+	tracer := newSTOTracer(nil, map[common.Address]bool{testSender: true})
+	tracer.OnOpcode(0, byte(KECCAK256), 100000, 30, scopeForKeccak(preimage), nil, 1, nil)
+	tracer.OnOpcode(1, byte(SLOAD), 100000, 200, scopeForSload(testExternalContract, offsetSlot), nil, 1, nil)
+	tracer.OnExit(1, nil, 50000, nil, false)
+	v := tracer.Violation()
+	if v == nil {
+		t.Fatal("expected STO-021 violation for offset 129")
+	}
+	if v.Rule != "STO-021" {
+		t.Fatalf("expected STO-021, got %s", v.Rule)
+	}
+}
+
+// TestSTO021_NonAssociated verifies non-associated external storage is rejected.
+func TestSTO021_NonAssociated(t *testing.T) {
+	tracer := newSTOTracer(nil, map[common.Address]bool{testSender: true})
+	// SLOAD on external contract — no keccak preimage, slot value doesn't match sender.
+	scope := scopeForSload(testExternalContract, testSlot)
+	tracer.OnOpcode(0, byte(SLOAD), 100000, 200, scope, nil, 1, nil)
+	tracer.OnExit(1, nil, 50000, nil, false)
+	v := tracer.Violation()
+	if v == nil {
+		t.Fatal("expected STO-021 violation")
+	}
+	if v.Rule != "STO-021" {
+		t.Fatalf("expected STO-021, got %s", v.Rule)
+	}
+}
+
+// TestSTO021_MixedAccesses verifies violation on third access in a mixed sequence.
+func TestSTO021_MixedAccesses(t *testing.T) {
+	senderHash := common.BytesToHash(testSender.Bytes())
+	associatedSlot := common.HexToHash("0x10")
+	nonAssociatedSlot := common.HexToHash("0x20")
+
+	tracer := newSTOTracer(
+		map[common.Address]map[common.Hash]common.Hash{
+			testExternalContract: {associatedSlot: senderHash}, // direct value match
+		},
+		map[common.Address]bool{testSender: true},
+	)
+	// 1. Sender own storage — STO-010, always allowed.
+	tracer.OnOpcode(0, byte(SLOAD), 100000, 200, scopeForSload(testSender, testSlot), nil, 1, nil)
+	// 2. External associated storage — STO-021, allowed (direct match).
+	tracer.OnOpcode(1, byte(SLOAD), 100000, 200, scopeForSload(testExternalContract, associatedSlot), nil, 1, nil)
+	// 3. External non-associated — should fail.
+	tracer.OnOpcode(2, byte(SLOAD), 100000, 200, scopeForSload(testExternalContract, nonAssociatedSlot), nil, 1, nil)
+	tracer.OnExit(1, nil, 50000, nil, false)
+	v := tracer.Violation()
+	if v == nil {
+		t.Fatal("expected STO-021 violation on third access")
+	}
+	if v.Rule != "STO-021" {
+		t.Fatalf("expected STO-021, got %s", v.Rule)
+	}
+}
+
+// TestSTO_NoExternalAccess verifies no violation when only sender storage is accessed.
+func TestSTO_NoExternalAccess(t *testing.T) {
+	tracer := newSTOTracer(nil, map[common.Address]bool{testSender: true})
+	tracer.OnOpcode(0, byte(SLOAD), 100000, 200, scopeForSload(testSender, testSlot), nil, 1, nil)
+	tracer.OnOpcode(1, byte(SLOAD), 100000, 200, scopeForSload(testSender, common.HexToHash("0x02")), nil, 1, nil)
+	tracer.OnExit(1, nil, 50000, nil, false)
+	if v := tracer.Violation(); v != nil {
+		t.Fatalf("unexpected violation: %s", v)
 	}
 }
