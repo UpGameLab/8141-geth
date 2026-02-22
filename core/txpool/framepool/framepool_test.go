@@ -588,6 +588,33 @@ func TestScopeOrderingNoPayer(t *testing.T) {
 	t.Logf("correctly rejected: %v", errs[0])
 }
 
+// TestApproveCallerNonSenderExec tests the new EIP-8141 APPROVE CALLER check:
+// a non-sender target calling APPROVE(0x0) should be rejected because
+// scope 0 requires ADDRESS == tx.sender.
+func TestApproveCallerNonSenderExec(t *testing.T) {
+	pool, statedb, config := newTestEnv()
+
+	sender := common.HexToAddress("0x1111111111111111111111111111111111111111")
+	payer := common.HexToAddress("0x2222222222222222222222222222222222222222")
+	statedb.CreateAccount(sender)
+	statedb.SetCode(sender, approveExecCode, tracing.CodeChangeUnspecified) // APPROVE(0x0) — valid from sender
+	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
+	statedb.CreateAccount(payer)
+	statedb.SetCode(payer, approveExecCode, tracing.CodeChangeUnspecified) // APPROVE(0x0) — payer tries exec approval
+
+	ftx := baseFTX(sender, 0, config)
+	ftx.Frames = []types.Frame{
+		{Mode: types.FrameModeVerify, Target: nil, GasLimit: 50000, Data: []byte{0x01}},     // sender → exec ✓
+		{Mode: types.FrameModeVerify, Target: &payer, GasLimit: 50000, Data: []byte{0x01}},   // payer → exec ✗ (ADDRESS != sender)
+	}
+
+	errs := pool.Add([]*types.Transaction{makeFrameTx(ftx)}, false)
+	if errs[0] == nil {
+		t.Fatal("expected rejection: non-sender target cannot APPROVE(0x0)")
+	}
+	t.Logf("correctly rejected: %v", errs[0])
+}
+
 func TestScopeOrderingExecReApproval(t *testing.T) {
 	pool, statedb, config := newTestEnv()
 

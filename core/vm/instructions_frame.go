@@ -54,6 +54,14 @@ type FrameContext struct {
 // It behaves like RETURN but with an additional scope operand that signals
 // approval status.
 //
+// Per EIP-8141, APPROVE enforces:
+//   - Must be in a frame tx context (FrameCtx != nil).
+//   - ADDRESS == frame.target: only the frame target contract can call APPROVE.
+//     This prevents subcalls from issuing approvals. DELEGATECALL preserves
+//     ADDRESS, so delegate patterns still work.
+//   - Scope 0x0/0x2 (execution approval): frame.target must equal tx.sender,
+//     since only the sender contract can approve execution.
+//
 // Stack: [offset, length, scope]
 func opApprove(pc *uint64, evm *EVM, scope *ScopeContext) ([]byte, error) {
 	offset, size := scope.Stack.pop(), scope.Stack.pop()
@@ -62,6 +70,26 @@ func opApprove(pc *uint64, evm *EVM, scope *ScopeContext) ([]byte, error) {
 	// Validate scope: must be 0, 1, or 2.
 	s := scopeVal.Uint64()
 	if s > 2 {
+		return nil, &ErrInvalidOpCode{opcode: APPROVE}
+	}
+
+	// Must be in a frame tx context.
+	if evm.FrameCtx == nil {
+		return nil, &ErrInvalidOpCode{opcode: APPROVE}
+	}
+
+	// ADDRESS == frame.target: only the frame target can call APPROVE.
+	currentFrame := evm.FrameCtx.Frames[evm.FrameCtx.FrameIndex]
+	frameTarget := evm.FrameCtx.Sender
+	if currentFrame.Target != nil {
+		frameTarget = *currentFrame.Target
+	}
+	if scope.Contract.Address() != frameTarget {
+		return nil, &ErrInvalidOpCode{opcode: APPROVE}
+	}
+
+	// Scope 0x0/0x2 (execution approval): frame.target must be tx.sender.
+	if (s == 0 || s == 2) && frameTarget != evm.FrameCtx.Sender {
 		return nil, &ErrInvalidOpCode{opcode: APPROVE}
 	}
 

@@ -884,6 +884,8 @@ func (st *stateTransition) executeFrames() (common.Address, []uint8, []uint64, [
 			senderChanged := false
 
 			// Rule for status 2 (execution approval).
+			// Note: opApprove already ensures target == sender for scope 0/2,
+			// but we keep this check as defense-in-depth.
 			if approveStatus == vm.ApproveExecution || approveStatus == vm.ApproveBoth {
 				if target == msg.From {
 					if senderApproved {
