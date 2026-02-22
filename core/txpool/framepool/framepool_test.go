@@ -101,6 +101,9 @@ var (
 		append([]byte{0x73}, make([]byte, 20)...), // PUSH20 0x00..00
 		0x31, 0x50, 0x60, 0x02, 0x60, 0x00, 0x60, 0x00, 0xaa,
 	)
+
+	// APPROVE(0x1) — payment approval: PUSH1 0x01, PUSH1 0x00, PUSH1 0x00, APPROVE(0xaa)
+	approvePayCode = []byte{0x60, 0x01, 0x60, 0x00, 0x60, 0x00, 0xaa}
 )
 
 func newTestEnv() (*FramePool, *state.StateDB, *params.ChainConfig) {
@@ -392,4 +395,216 @@ func TestFramePoolClear(t *testing.T) {
 	if pending, _ := pool.Stats(); pending != 0 {
 		t.Fatalf("expected 0 pending after Clear, got %d", pending)
 	}
+}
+
+// --- Frame ordering tests (pre-simulation) ---
+
+func TestFrameOrderingEmptyFrames(t *testing.T) {
+	sender := common.HexToAddress("0x1111111111111111111111111111111111111111")
+	if err := validateFrameOrdering(nil, sender); err == nil {
+		t.Fatal("expected rejection for empty frames")
+	}
+}
+
+func TestFrameOrderingInvalidMode(t *testing.T) {
+	sender := common.HexToAddress("0x1111111111111111111111111111111111111111")
+	frames := []types.Frame{{Mode: 3, GasLimit: 50000}}
+	if err := validateFrameOrdering(frames, sender); err == nil {
+		t.Fatal("expected rejection for invalid mode")
+	}
+}
+
+func TestFrameOrderingNoVerify(t *testing.T) {
+	sender := common.HexToAddress("0x1111111111111111111111111111111111111111")
+	target := common.HexToAddress("0x2222222222222222222222222222222222222222")
+	frames := []types.Frame{
+		{Mode: types.FrameModeDefault, Target: &target, GasLimit: 50000},
+		{Mode: types.FrameModeSender, Target: &target, GasLimit: 50000},
+	}
+	if err := validateFrameOrdering(frames, sender); err == nil {
+		t.Fatal("expected rejection for no VERIFY frame")
+	}
+}
+
+func TestFrameOrderingSenderBeforeVerify(t *testing.T) {
+	sender := common.HexToAddress("0x1111111111111111111111111111111111111111")
+	target := common.HexToAddress("0x2222222222222222222222222222222222222222")
+	frames := []types.Frame{
+		{Mode: types.FrameModeSender, Target: &target, GasLimit: 50000},
+		{Mode: types.FrameModeVerify, Target: nil, GasLimit: 50000}, // targets sender
+	}
+	if err := validateFrameOrdering(frames, sender); err == nil {
+		t.Fatal("expected rejection for SENDER before VERIFY(sender)")
+	}
+}
+
+func TestFrameOrderingSenderAfterVerify(t *testing.T) {
+	sender := common.HexToAddress("0x1111111111111111111111111111111111111111")
+	target := common.HexToAddress("0x2222222222222222222222222222222222222222")
+	frames := []types.Frame{
+		{Mode: types.FrameModeVerify, Target: nil, GasLimit: 50000}, // targets sender
+		{Mode: types.FrameModeSender, Target: &target, GasLimit: 50000},
+	}
+	if err := validateFrameOrdering(frames, sender); err != nil {
+		t.Fatalf("expected acceptance, got: %v", err)
+	}
+}
+
+func TestFrameOrderingSenderAfterNonSenderVerify(t *testing.T) {
+	sender := common.HexToAddress("0x1111111111111111111111111111111111111111")
+	other := common.HexToAddress("0x2222222222222222222222222222222222222222")
+	target := common.HexToAddress("0x3333333333333333333333333333333333333333")
+	frames := []types.Frame{
+		{Mode: types.FrameModeVerify, Target: &other, GasLimit: 50000}, // targets other, not sender
+		{Mode: types.FrameModeSender, Target: &target, GasLimit: 50000},
+	}
+	if err := validateFrameOrdering(frames, sender); err == nil {
+		t.Fatal("expected rejection for SENDER after VERIFY(other) without VERIFY(sender)")
+	}
+}
+
+// --- Scope ordering tests (post-simulation, integration) ---
+
+func TestScopeOrderingExecThenPay(t *testing.T) {
+	pool, statedb, config := newTestEnv()
+
+	sender := common.HexToAddress("0x1111111111111111111111111111111111111111")
+	payer := common.HexToAddress("0x2222222222222222222222222222222222222222")
+	target := common.HexToAddress("0x3333333333333333333333333333333333333333")
+	statedb.CreateAccount(sender)
+	statedb.SetCode(sender, approveExecCode, tracing.CodeChangeUnspecified)
+	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
+	statedb.CreateAccount(payer)
+	statedb.SetCode(payer, approvePayCode, tracing.CodeChangeUnspecified)
+
+	ftx := baseFTX(sender, 0, config)
+	ftx.Frames = []types.Frame{
+		{Mode: types.FrameModeVerify, Target: nil, GasLimit: 50000, Data: []byte{0x01}},      // sender → exec
+		{Mode: types.FrameModeVerify, Target: &payer, GasLimit: 50000, Data: []byte{0x01}},    // payer → pay
+		{Mode: types.FrameModeDefault, Target: &target, GasLimit: 50000, Data: []byte{0x01}},
+	}
+
+	errs := pool.Add([]*types.Transaction{makeFrameTx(ftx)}, false)
+	if errs[0] != nil {
+		t.Fatalf("expected acceptance for exec→pay ordering, got: %v", errs[0])
+	}
+}
+
+func TestScopeOrderingPayBeforeExec(t *testing.T) {
+	pool, statedb, config := newTestEnv()
+
+	sender := common.HexToAddress("0x1111111111111111111111111111111111111111")
+	payer := common.HexToAddress("0x2222222222222222222222222222222222222222")
+	statedb.CreateAccount(sender)
+	statedb.SetCode(sender, approveExecCode, tracing.CodeChangeUnspecified)
+	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
+	statedb.CreateAccount(payer)
+	statedb.SetCode(payer, approvePayCode, tracing.CodeChangeUnspecified)
+
+	ftx := baseFTX(sender, 0, config)
+	ftx.Frames = []types.Frame{
+		{Mode: types.FrameModeVerify, Target: &payer, GasLimit: 50000, Data: []byte{0x01}},  // payer → pay (before exec!)
+		{Mode: types.FrameModeVerify, Target: nil, GasLimit: 50000, Data: []byte{0x01}},     // sender → exec
+	}
+
+	errs := pool.Add([]*types.Transaction{makeFrameTx(ftx)}, false)
+	if errs[0] == nil {
+		t.Fatal("expected rejection for payment before execution approval")
+	}
+	t.Logf("correctly rejected: %v", errs[0])
+}
+
+func TestScopeOrderingDoublePayer(t *testing.T) {
+	pool, statedb, config := newTestEnv()
+
+	sender := common.HexToAddress("0x1111111111111111111111111111111111111111")
+	payerA := common.HexToAddress("0x2222222222222222222222222222222222222222")
+	payerB := common.HexToAddress("0x3333333333333333333333333333333333333333")
+	statedb.CreateAccount(sender)
+	statedb.SetCode(sender, approveExecCode, tracing.CodeChangeUnspecified)
+	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
+	statedb.CreateAccount(payerA)
+	statedb.SetCode(payerA, approvePayCode, tracing.CodeChangeUnspecified)
+	statedb.CreateAccount(payerB)
+	statedb.SetCode(payerB, approvePayCode, tracing.CodeChangeUnspecified)
+
+	ftx := baseFTX(sender, 0, config)
+	ftx.Frames = []types.Frame{
+		{Mode: types.FrameModeVerify, Target: nil, GasLimit: 50000, Data: []byte{0x01}},       // sender → exec
+		{Mode: types.FrameModeVerify, Target: &payerA, GasLimit: 50000, Data: []byte{0x01}},   // payerA → pay
+		{Mode: types.FrameModeVerify, Target: &payerB, GasLimit: 50000, Data: []byte{0x01}},   // payerB → pay (duplicate!)
+	}
+
+	errs := pool.Add([]*types.Transaction{makeFrameTx(ftx)}, false)
+	if errs[0] == nil {
+		t.Fatal("expected rejection for duplicate payer")
+	}
+	t.Logf("correctly rejected: %v", errs[0])
+}
+
+func TestScopeOrderingBothAfterExec(t *testing.T) {
+	pool, statedb, config := newTestEnv()
+
+	sender := common.HexToAddress("0x1111111111111111111111111111111111111111")
+	payer := common.HexToAddress("0x2222222222222222222222222222222222222222")
+	statedb.CreateAccount(sender)
+	statedb.SetCode(sender, approveExecCode, tracing.CodeChangeUnspecified)
+	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
+	statedb.CreateAccount(payer)
+	statedb.SetCode(payer, approveBothCode, tracing.CodeChangeUnspecified) // ApproveBoth
+
+	ftx := baseFTX(sender, 0, config)
+	ftx.Frames = []types.Frame{
+		{Mode: types.FrameModeVerify, Target: nil, GasLimit: 50000, Data: []byte{0x01}},     // sender → exec
+		{Mode: types.FrameModeVerify, Target: &payer, GasLimit: 50000, Data: []byte{0x01}},  // payer → both (exec already done!)
+	}
+
+	errs := pool.Add([]*types.Transaction{makeFrameTx(ftx)}, false)
+	if errs[0] == nil {
+		t.Fatal("expected rejection for ApproveBoth after separate execution approval")
+	}
+	t.Logf("correctly rejected: %v", errs[0])
+}
+
+func TestScopeOrderingNoPayer(t *testing.T) {
+	pool, statedb, config := newTestEnv()
+
+	sender := common.HexToAddress("0x1111111111111111111111111111111111111111")
+	target := common.HexToAddress("0x2222222222222222222222222222222222222222")
+	statedb.CreateAccount(sender)
+	statedb.SetCode(sender, approveExecCode, tracing.CodeChangeUnspecified)
+	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
+
+	ftx := baseFTX(sender, 0, config)
+	ftx.Frames = []types.Frame{
+		{Mode: types.FrameModeVerify, Target: nil, GasLimit: 50000, Data: []byte{0x01}},        // sender → exec only
+		{Mode: types.FrameModeDefault, Target: &target, GasLimit: 50000, Data: []byte{0x01}},
+	}
+
+	errs := pool.Add([]*types.Transaction{makeFrameTx(ftx)}, false)
+	if errs[0] == nil {
+		t.Fatal("expected rejection for no payer approved")
+	}
+	t.Logf("correctly rejected: %v", errs[0])
+}
+
+func TestScopeOrderingExecReApproval(t *testing.T) {
+	pool, statedb, config := newTestEnv()
+
+	sender := common.HexToAddress("0x1111111111111111111111111111111111111111")
+	statedb.CreateAccount(sender)
+	statedb.SetCode(sender, approveExecCode, tracing.CodeChangeUnspecified)
+	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
+
+	ftx := baseFTX(sender, 0, config)
+	ftx.Frames = []types.Frame{
+		{Mode: types.FrameModeVerify, Target: nil, GasLimit: 50000, Data: []byte{0x01}}, // sender → exec
+		{Mode: types.FrameModeVerify, Target: nil, GasLimit: 50000, Data: []byte{0x02}}, // sender → exec again!
+	}
+
+	errs := pool.Add([]*types.Transaction{makeFrameTx(ftx)}, false)
+	if errs[0] == nil {
+		t.Fatal("expected rejection for execution re-approval")
+	}
+	t.Logf("correctly rejected: %v", errs[0])
 }

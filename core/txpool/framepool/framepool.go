@@ -277,6 +277,11 @@ func (p *FramePool) validateAndAdd(tx *types.Transaction) error {
 		return fmt.Errorf("%w: tx nonce %d, state nonce %d", core.ErrNonceTooLow, tx.Nonce(), stateNonce)
 	}
 
+	// Static frame ordering validation (pre-simulation, O(n)).
+	if err := validateFrameOrdering(frameTx.Frames, sender); err != nil {
+		return err
+	}
+
 	// Reserve address (if first tx for this sender).
 	if len(p.pending[sender]) == 0 {
 		if err := p.reserver.Hold(sender); err != nil {
@@ -324,6 +329,7 @@ func (p *FramePool) simulateVerifyFrames(frameTx *types.FrameTx) error {
 		frameCtx.BlobHashes = frameTx.BlobHashes
 	}
 
+	var results []verifyResult
 	for i, frame := range frameTx.Frames {
 		if frame.Mode != types.FrameModeVerify {
 			continue
@@ -383,15 +389,115 @@ func (p *FramePool) simulateVerifyFrames(frameTx *types.FrameTx) error {
 			return fmt.Errorf("VERIFY frame %d: %w", i, violation)
 		}
 
-		// Check that APPROVE was called.
-		if evm.ApproveScope < vm.ApproveExecution || evm.ApproveScope > vm.ApproveBoth {
+		// Check that APPROVE was called and record scope.
+		scope := evm.ApproveScope
+		if scope < vm.ApproveExecution || scope > vm.ApproveBoth {
 			if vmerr != nil {
 				return fmt.Errorf("VERIFY frame %d execution failed: %v", i, vmerr)
 			}
 			return fmt.Errorf("VERIFY frame %d did not APPROVE", i)
 		}
+		results = append(results, verifyResult{
+			frameIndex:   i,
+			approveScope: scope,
+			target:       target,
+		})
 
 		evm.FrameCtx = nil
+	}
+	// Post-simulation: validate approval scope ordering.
+	return validateScopeOrdering(frameTx.Frames, frameTx.Sender, results)
+}
+
+// verifyResult records the approval scope and target of a simulated VERIFY frame.
+type verifyResult struct {
+	frameIndex   int
+	approveScope uint8
+	target       common.Address
+}
+
+// validateFrameOrdering performs pre-simulation static validation of frame ordering.
+// It checks structural constraints that don't require EVM execution.
+func validateFrameOrdering(frames []types.Frame, sender common.Address) error {
+	if len(frames) == 0 {
+		return fmt.Errorf("frame transaction has no frames")
+	}
+	hasVerify := false
+	hasSenderVerify := false // VERIFY frame targeting sender has been seen
+	for _, frame := range frames {
+		if frame.Mode > types.FrameModeSender {
+			return fmt.Errorf("frame has invalid mode %d", frame.Mode)
+		}
+		if frame.Mode == types.FrameModeVerify {
+			hasVerify = true
+			target := sender
+			if frame.Target != nil {
+				target = *frame.Target
+			}
+			if target == sender {
+				hasSenderVerify = true
+			}
+		}
+		if frame.Mode == types.FrameModeSender && !hasSenderVerify {
+			return fmt.Errorf("SENDER frame before any VERIFY targeting sender")
+		}
+	}
+	if !hasVerify {
+		return fmt.Errorf("no VERIFY frame in transaction")
+	}
+	return nil
+}
+
+// validateScopeOrdering checks that the VERIFY frame approval scopes follow valid
+// ordering rules. This mirrors the approval state machine in state_transition.go.
+func validateScopeOrdering(frames []types.Frame, sender common.Address, results []verifyResult) error {
+	scopeMap := make(map[int]verifyResult, len(results))
+	for _, r := range results {
+		scopeMap[r.frameIndex] = r
+	}
+
+	var senderApproved, payerApproved bool
+	for i, frame := range frames {
+		// SENDER mode requires prior execution approval.
+		if frame.Mode == types.FrameModeSender && !senderApproved {
+			return fmt.Errorf("SENDER frame %d before execution approval", i)
+		}
+
+		result, isVerify := scopeMap[i]
+		if !isVerify {
+			continue
+		}
+
+		senderApprovedBefore := senderApproved
+		scope := result.approveScope
+		target := result.target
+
+		// Execution approval (mirrors state_transition.go:887-896).
+		if scope == vm.ApproveExecution || scope == vm.ApproveBoth {
+			if target == sender {
+				if senderApproved {
+					return fmt.Errorf("VERIFY frame %d: execution re-approval", i)
+				}
+				senderApproved = true
+			}
+		}
+
+		// Payment approval (mirrors state_transition.go:899-914).
+		if scope == vm.ApprovePayment || scope == vm.ApproveBoth {
+			if !senderApprovedBefore && scope == vm.ApprovePayment {
+				return fmt.Errorf("VERIFY frame %d: payment approval without prior execution approval", i)
+			}
+			if senderApprovedBefore && scope == vm.ApproveBoth {
+				return fmt.Errorf("VERIFY frame %d: ApproveBoth after separate execution approval", i)
+			}
+			if payerApproved {
+				return fmt.Errorf("VERIFY frame %d: duplicate payer approval", i)
+			}
+			payerApproved = true
+		}
+	}
+	if !payerApproved {
+		return fmt.Errorf("no payer approved among VERIFY frames")
 	}
 	return nil
 }
