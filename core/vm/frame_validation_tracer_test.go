@@ -132,7 +132,7 @@ func newTestTracer() *FrameValidationTracer {
 			testPrecompile1: 0, // precompiles have no code but are whitelisted
 		},
 	}
-	return NewFrameValidationTracer(state, testSender, []common.Address{testPrecompile1})
+	return NewFrameValidationTracer(state, testSender, testSender, []common.Address{testPrecompile1})
 }
 
 // scopeForExt creates a mock scope for EXT* opcodes (address at stack top).
@@ -396,7 +396,7 @@ func newSTOTracer(state map[common.Address]map[common.Hash]common.Hash, exists m
 		state:  state,
 		exists: exists,
 	}
-	return NewFrameValidationTracer(db, testSender, []common.Address{testPrecompile1})
+	return NewFrameValidationTracer(db, testSender, testSender, []common.Address{testPrecompile1})
 }
 
 // scopeForSload creates a scope for SLOAD: slot at stack top, with contract address.
@@ -579,6 +579,29 @@ func TestSTO021_MixedAccesses(t *testing.T) {
 	}
 	if v.Rule != "STO-021" {
 		t.Fatalf("expected STO-021, got %s", v.Rule)
+	}
+}
+
+// TestSTO031_FrameTargetOwnStorage verifies that a VERIFY frame's target can
+// read its own storage without STO-021 violation (entity's own storage exempt,
+// analogous to ERC-7562 STO-031 without staking requirement).
+func TestSTO031_FrameTargetOwnStorage(t *testing.T) {
+	paymaster := common.HexToAddress("0x5555555555555555555555555555555555555555")
+	db := &mockStateDB{
+		codeSize: map[common.Address]int{
+			testContract: 100,
+			paymaster:    100,
+		},
+		exists: map[common.Address]bool{testSender: true},
+	}
+	// Tracer where sender != frameTarget (paymaster scenario).
+	tracer := NewFrameValidationTracer(db, testSender, paymaster, []common.Address{testPrecompile1})
+
+	// Paymaster reads its own storage — should be allowed.
+	tracer.OnOpcode(0, byte(SLOAD), 100000, 200, scopeForSload(paymaster, testSlot), nil, 1, nil)
+	tracer.OnExit(1, nil, 50000, nil, false)
+	if v := tracer.Violation(); v != nil {
+		t.Fatalf("unexpected violation for frame target's own storage: %s", v)
 	}
 }
 

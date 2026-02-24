@@ -74,6 +74,7 @@ type storageAccess struct {
 type FrameValidationTracer struct {
 	stateDB     StateDB            // For GetCodeSize (OP-041) and GetState (STO-021)
 	sender      common.Address     // tx.sender — exempt from OP-041, owns storage (STO-010)
+	frameTarget common.Address     // VERIFY frame target — exempt from STO-021 (entity's own storage)
 	precompiles map[common.Address]bool
 
 	lastOp      OpCode // Previous opcode for GAS rule (OP-012)
@@ -93,7 +94,9 @@ type FrameValidationTracer struct {
 }
 
 // NewFrameValidationTracer creates a tracer for VERIFY frame validation.
-func NewFrameValidationTracer(stateDB StateDB, sender common.Address, precompiles []common.Address) *FrameValidationTracer {
+// frameTarget is the VERIFY frame's target address — its own storage is exempt
+// from STO-021 checks (entity's own storage, analogous to ERC-7562 STO-031).
+func NewFrameValidationTracer(stateDB StateDB, sender common.Address, frameTarget common.Address, precompiles []common.Address) *FrameValidationTracer {
 	pm := make(map[common.Address]bool, len(precompiles))
 	for _, addr := range precompiles {
 		pm[addr] = true
@@ -101,6 +104,7 @@ func NewFrameValidationTracer(stateDB StateDB, sender common.Address, precompile
 	return &FrameValidationTracer{
 		stateDB:         stateDB,
 		sender:          sender,
+		frameTarget:     frameTarget,
 		precompiles:     pm,
 		keccakPreimages: make(map[string]struct{}),
 	}
@@ -185,8 +189,10 @@ func (t *FrameValidationTracer) OnOpcode(pc uint64, op byte, gas, cost uint64, s
 		if len(stackData) > 0 {
 			slot := common.BytesToHash(stackData[len(stackData)-1].Bytes())
 			addr := scope.Address()
-			// STO-010: sender's own storage is always allowed — skip recording.
-			if addr != t.sender {
+			// STO-010: sender's own storage is always allowed.
+			// STO-031 (adapted): VERIFY frame target's own storage is allowed
+			// (entity's own storage — EIP-8141 has no staking, so unconditional).
+			if addr != t.sender && addr != t.frameTarget {
 				t.externalStorageAccesses = append(t.externalStorageAccesses, storageAccess{addr: addr, slot: slot})
 			}
 		}

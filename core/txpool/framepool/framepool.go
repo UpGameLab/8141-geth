@@ -343,8 +343,14 @@ func (p *FramePool) simulateVerifyFrames(frameTx *types.FrameTx) error {
 		// Use a copy of state to avoid polluting the pool's state.
 		simState := p.currentState.Copy()
 
+		// Determine target.
+		target := frameTx.Sender
+		if frame.Target != nil {
+			target = *frame.Target
+		}
+
 		// Create validation tracer.
-		tracer := vm.NewFrameValidationTracer(simState, frameTx.Sender, precompiles)
+		tracer := vm.NewFrameValidationTracer(simState, frameTx.Sender, target, precompiles)
 
 		// Create EVM with a minimal block context for simulation.
 		random := common.Hash{}
@@ -370,12 +376,6 @@ func (p *FramePool) simulateVerifyFrames(frameTx *types.FrameTx) error {
 		})
 		evm.FrameCtx = frameCtx
 		frameCtx.FrameIndex = i
-
-		// Determine target.
-		target := frameTx.Sender
-		if frame.Target != nil {
-			target = *frame.Target
-		}
 
 		// Prepare state.
 		simState.Prepare(rules, frameTx.Sender, common.Address{}, &target, precompiles, nil)
