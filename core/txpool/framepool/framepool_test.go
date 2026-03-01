@@ -88,7 +88,12 @@ var (
 	returnCode = []byte{0x60, 0x00, 0x60, 0x00, 0xf3}
 
 	// TIMESTAMP then APPROVE(0x2): TIMESTAMP, PUSH1 0x02, PUSH1 0x00, PUSH1 0x00, APPROVE(0xaa)
+	// For use in VERIFY frames only (proves TIMESTAMP is OP-011 banned in VERIFY).
 	timestampThenApproveCode = []byte{0x42, 0x60, 0x02, 0x60, 0x00, 0x60, 0x00, 0xaa}
+
+	// TIMESTAMP then RETURN: TIMESTAMP(0x42), POP(0x50), PUSH1 0x00, PUSH1 0x00, RETURN(0xf3)
+	// For use in DEFAULT frames to verify TIMESTAMP is not banned outside VERIFY context.
+	timestampThenReturnCode = []byte{0x42, 0x50, 0x60, 0x00, 0x60, 0x00, 0xf3}
 
 	// GAS, ADD (OP-012 violation), then APPROVE(0x2):
 	// GAS(0x5a), PUSH1 0x00, ADD(0x01), POP(0x50), PUSH1 0x02, PUSH1 0x00, PUSH1 0x00, APPROVE(0xaa)
@@ -360,19 +365,21 @@ func TestFramePoolDefaultFrameSkipsValidation(t *testing.T) {
 	statedb.SetCode(sender, approveBothCode, tracing.CodeChangeUnspecified)
 	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
 
-	// Target uses TIMESTAMP — would fail VERIFY validation but should be fine in DEFAULT mode.
+	// Target uses TIMESTAMP — would trigger OP-011 ban if run through VERIFY validation,
+	// but DEFAULT frames are pre-executed without the ERC-7562 validation tracer attached.
+	// DEFAULT frames must still succeed execution; they just aren't subject to opcode rules.
 	statedb.CreateAccount(target)
-	statedb.SetCode(target, timestampThenApproveCode, tracing.CodeChangeUnspecified)
+	statedb.SetCode(target, timestampThenReturnCode, tracing.CodeChangeUnspecified)
 
 	ftx := baseFTX(sender, 0, config)
 	ftx.Frames = []types.Frame{
-		{Mode: types.FrameModeVerify, Target: nil, GasLimit: 50000, Data: []byte{0x01}},    // VERIFY on sender (valid)
-		{Mode: types.FrameModeDefault, Target: &target, GasLimit: 50000, Data: []byte{0x01}}, // DEFAULT on target (not validated)
+		{Mode: types.FrameModeVerify, Target: nil, GasLimit: 50000, Data: []byte{0x01}},     // VERIFY on sender (valid)
+		{Mode: types.FrameModeDefault, Target: &target, GasLimit: 50000, Data: []byte{0x01}}, // DEFAULT on target (no opcode restrictions)
 	}
 
 	errs := pool.Add([]*types.Transaction{makeFrameTx(ftx)}, false)
 	if errs[0] != nil {
-		t.Fatalf("expected acceptance (DEFAULT frames skip validation), got: %v", errs[0])
+		t.Fatalf("expected acceptance (DEFAULT frames exempt from ERC-7562 opcode rules), got: %v", errs[0])
 	}
 }
 

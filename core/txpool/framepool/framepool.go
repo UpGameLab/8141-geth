@@ -46,6 +46,10 @@ const (
 	// verifyFrameGasCap is the ERC-7562 MAX_VERIFICATION_GAS.
 	verifyFrameGasCap uint64 = 500_000
 
+	// defaultFrameGasCap limits the gas spent pre-executing DEFAULT frames during
+	// mempool simulation. Mirrors ERC-7562's MAX_VERIFICATION_GAS for factory ops.
+	defaultFrameGasCap uint64 = 500_000
+
 	// txMaxSize is the maximum frame transaction size.
 	txMaxSize uint64 = 512 * 1024
 )
@@ -303,8 +307,16 @@ func (p *FramePool) validateAndAdd(tx *types.Transaction) error {
 	return nil
 }
 
-// simulateVerifyFrames runs each VERIFY frame through the EVM with the validation
-// tracer attached, checking ERC-7562 opcode rules and APPROVE status.
+// simulateVerifyFrames runs the frame transaction through a two-phase EVM simulation
+// to validate VERIFY frames under ERC-7562 opcode rules.
+//
+// Phase 1 (DEFAULT frames): pre-executes any DEFAULT frames against a shared base
+// state copy, so that contracts deployed in DEFAULT frames exist when VERIFY frames
+// run. This mirrors how ERC-7562 simulates factory (initCode) before validation.
+//
+// Phase 2 (VERIFY frames): runs each VERIFY frame against a fresh copy of the base
+// state (which now includes DEFAULT frame side-effects) with the validation tracer
+// attached, checking ERC-7562 opcode rules and APPROVE status.
 func (p *FramePool) simulateVerifyFrames(frameTx *types.FrameTx) error {
 	head := p.currentHead
 	rules := p.chainconfig.Rules(head.Number, head.Difficulty.Sign() == 0, head.Time)
@@ -329,6 +341,54 @@ func (p *FramePool) simulateVerifyFrames(frameTx *types.FrameTx) error {
 		frameCtx.BlobHashes = frameTx.BlobHashes
 	}
 
+	// Shared block context used for both simulation phases.
+	random := common.Hash{}
+	blockCtx := vm.BlockContext{
+		CanTransfer: core.CanTransfer,
+		Transfer:    core.Transfer,
+		GetHash:     func(uint64) common.Hash { return common.Hash{} },
+		Coinbase:    common.Address{},
+		GasLimit:    head.GasLimit,
+		BlockNumber: new(big.Int).Add(head.Number, big.NewInt(1)),
+		Time:        head.Time + 12,
+		Difficulty:  new(big.Int),
+		BaseFee:     head.BaseFee,
+		Random:      &random,
+	}
+
+	// Phase 1: pre-execute DEFAULT frames on a shared base state.
+	// DEFAULT frames may deploy the contract that VERIFY frames will call, so they
+	// must run first. No validation tracer is attached — DEFAULT frames are not
+	// subject to ERC-7562 opcode restrictions.
+	baseState := p.currentState.Copy()
+	for i, frame := range frameTx.Frames {
+		if frame.Mode != types.FrameModeDefault {
+			continue
+		}
+		if frame.GasLimit > defaultFrameGasCap {
+			return fmt.Errorf("DEFAULT frame %d gas %d exceeds cap %d", i, frame.GasLimit, defaultFrameGasCap)
+		}
+		target := frameTx.Sender
+		if frame.Target != nil {
+			target = *frame.Target
+		}
+		evm := vm.NewEVM(blockCtx, baseState, p.chainconfig, vm.Config{})
+		evm.SetTxContext(vm.TxContext{
+			Origin:   params.FrameEntryPointAddress,
+			GasPrice: new(big.Int),
+		})
+		evm.FrameCtx = frameCtx
+		frameCtx.FrameIndex = i
+		baseState.Prepare(rules, frameTx.Sender, common.Address{}, &target, precompiles, nil)
+		_, _, vmerr := evm.Call(params.FrameEntryPointAddress, target, frame.Data, frame.GasLimit, new(uint256.Int))
+		evm.FrameCtx = nil
+		if vmerr != nil {
+			return fmt.Errorf("DEFAULT frame %d simulation failed: %v", i, vmerr)
+		}
+	}
+
+	// Phase 2: simulate each VERIFY frame using a copy of baseState so that
+	// DEFAULT frame side-effects (e.g. deployed contracts) are visible.
 	var results []verifyResult
 	for i, frame := range frameTx.Frames {
 		if frame.Mode != types.FrameModeVerify {
@@ -340,8 +400,9 @@ func (p *FramePool) simulateVerifyFrames(frameTx *types.FrameTx) error {
 			return fmt.Errorf("VERIFY frame %d gas %d exceeds cap %d", i, frame.GasLimit, verifyFrameGasCap)
 		}
 
-		// Use a copy of state to avoid polluting the pool's state.
-		simState := p.currentState.Copy()
+		// Use a copy of baseState (which includes DEFAULT frame effects) to avoid
+		// polluting the pool's state and to isolate VERIFY frames from each other.
+		simState := baseState.Copy()
 
 		// Determine target.
 		target := frameTx.Sender
@@ -352,20 +413,6 @@ func (p *FramePool) simulateVerifyFrames(frameTx *types.FrameTx) error {
 		// Create validation tracer.
 		tracer := vm.NewFrameValidationTracer(simState, frameTx.Sender, target, precompiles)
 
-		// Create EVM with a minimal block context for simulation.
-		random := common.Hash{}
-		blockCtx := vm.BlockContext{
-			CanTransfer: core.CanTransfer,
-			Transfer:    core.Transfer,
-			GetHash:     func(uint64) common.Hash { return common.Hash{} },
-			Coinbase:    common.Address{},
-			GasLimit:    head.GasLimit,
-			BlockNumber: new(big.Int).Add(head.Number, big.NewInt(1)),
-			Time:        head.Time + 12,
-			Difficulty:  new(big.Int),
-			BaseFee:     head.BaseFee,
-			Random:      &random,
-		}
 		evmConfig := vm.Config{
 			Tracer: tracer.Hooks(),
 		}
