@@ -168,6 +168,9 @@ const (
 
 	P256VerifyGas uint64 = 6900 // secp256r1 elliptic curve signature verifier gas price
 
+	NttFwGas  uint64 = 600 // Gas price for forward NTT transformation (EIP-NTT)
+	NttInvGas uint64 = 600 // Gas price for inverse NTT transformation (EIP-NTT)
+
 	// The Refund Quotient is the cap on how much of the used gas can be refunded. Before EIP-3529,
 	// up to half the consumed gas could be refunded. Redefined as 1/5th in EIP-3529
 	RefundQuotient        uint64 = 2
