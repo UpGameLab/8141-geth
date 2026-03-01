@@ -356,12 +356,21 @@ func (p *FramePool) simulateVerifyFrames(frameTx *types.FrameTx) error {
 		Random:      &random,
 	}
 
-	// Phase 1: pre-execute DEFAULT frames on a shared base state.
-	// DEFAULT frames may deploy the contract that VERIFY frames will call, so they
-	// must run first. No validation tracer is attached — DEFAULT frames are not
-	// subject to ERC-7562 opcode restrictions.
-	baseState := p.currentState.Copy()
+	// Phase 1: pre-execute DEFAULT frames that appear before the first VERIFY frame.
+	// These are deploy/setup frames (analogous to ERC-4337 initCode) whose side-effects
+	// (e.g. deployed contracts) must be visible when VERIFY frames run.
+	// DEFAULT frames that come after VERIFY frames (e.g. postOp) are execution-phase
+	// frames that only make sense after SENDER frames run — skip them here.
+	firstVerifyIdx := len(frameTx.Frames)
 	for i, frame := range frameTx.Frames {
+		if frame.Mode == types.FrameModeVerify {
+			firstVerifyIdx = i
+			break
+		}
+	}
+
+	baseState := p.currentState.Copy()
+	for i, frame := range frameTx.Frames[:firstVerifyIdx] {
 		if frame.Mode != types.FrameModeDefault {
 			continue
 		}
