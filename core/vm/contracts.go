@@ -168,13 +168,10 @@ var PrecompiledContractsOsaka = PrecompiledContracts{
 	common.BytesToAddress([]byte{0x10}): &bls12381MapG1{},
 	common.BytesToAddress([]byte{0x11}): &bls12381MapG2{},
 
-	common.BytesToAddress([]byte{0x1, 0x00}): &p256Verify{},
+	common.BytesToAddress([]byte{0x12}): &verifyMLDSA{},
+	common.BytesToAddress([]byte{0x13}): &verifyMLDSAEth{},
 
-	// NTT precompiles (EIP-NTT)
-	common.BytesToAddress([]byte{0x1, 0x01}): &nttForward{},
-	common.BytesToAddress([]byte{0x1, 0x02}): &nttInverse{},
-	common.BytesToAddress([]byte{0x1, 0x03}): &nttVecMulMod{},
-	common.BytesToAddress([]byte{0x1, 0x04}): &nttVecAddMod{},
+	common.BytesToAddress([]byte{0x1, 0x00}): &p256Verify{},
 }
 
 // PrecompiledContractsP256Verify contains the precompiled Ethereum
@@ -183,13 +180,11 @@ var PrecompiledContractsP256Verify = PrecompiledContracts{
 	common.BytesToAddress([]byte{0x1, 0x00}): &p256Verify{},
 }
 
-// PrecompiledContractsNTT contains the precompiled Ethereum
-// contracts specified in EIP-NTT. This is exported for testing purposes.
-var PrecompiledContractsNTT = PrecompiledContracts{
-	common.BytesToAddress([]byte{0x1, 0x01}): &nttForward{},
-	common.BytesToAddress([]byte{0x1, 0x02}): &nttInverse{},
-	common.BytesToAddress([]byte{0x1, 0x03}): &nttVecMulMod{},
-	common.BytesToAddress([]byte{0x1, 0x04}): &nttVecAddMod{},
+// PrecompiledContractsMLDSA contains the precompiled Ethereum contracts
+// specified in EIP-8051. This is exported for testing purposes.
+var PrecompiledContractsMLDSA = PrecompiledContracts{
+	common.BytesToAddress([]byte{0x12}): &verifyMLDSA{},
+	common.BytesToAddress([]byte{0x13}): &verifyMLDSAEth{},
 }
 
 var (

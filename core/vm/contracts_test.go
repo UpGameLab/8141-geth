@@ -69,11 +69,8 @@ var allPrecompiles = map[common.Address]PrecompiledContract{
 
 	common.BytesToAddress([]byte{0x0b}): &p256Verify{},
 
-	// NTT precompiles (EIP-NTT)
-	common.BytesToAddress([]byte{0x1, 0x01}): &nttForward{},
-	common.BytesToAddress([]byte{0x1, 0x02}): &nttInverse{},
-	common.BytesToAddress([]byte{0x1, 0x03}): &nttVecMulMod{},
-	common.BytesToAddress([]byte{0x1, 0x04}): &nttVecAddMod{},
+	common.BytesToAddress([]byte{0x12}): &verifyMLDSA{},
+	common.BytesToAddress([]byte{0x13}): &verifyMLDSAEth{},
 }
 
 // EIP-152 test vectors
