@@ -436,9 +436,15 @@ func (p *FramePool) simulateVerifyFrames(frameTx *types.FrameTx) error {
 		// Prepare state.
 		simState.Prepare(rules, frameTx.Sender, common.Address{}, &target, precompiles, nil)
 
-		// Execute VERIFY as StaticCall.
+		// Execute VERIFY: use default code for EOAs, StaticCall for contracts.
+		// Follow EIP-7702 delegation designators when checking for code.
 		caller := params.FrameEntryPointAddress
-		_, _, vmerr := evm.StaticCall(caller, target, frame.Data, frame.GasLimit)
+		var vmerr error
+		if hasNoCode(simState, target) {
+			_, _, vmerr = vm.ExecuteDefaultCode(evm, caller, target, frame.Data, frame.GasLimit, frame.Mode)
+		} else {
+			_, _, vmerr = evm.StaticCall(caller, target, frame.Data, frame.GasLimit)
+		}
 
 		// Check tracer violations first.
 		if violation := tracer.Violation(); violation != nil {
@@ -463,6 +469,19 @@ func (p *FramePool) simulateVerifyFrames(frameTx *types.FrameTx) error {
 	}
 	// Post-simulation: validate approval scope ordering.
 	return validateScopeOrdering(frameTx.Frames, frameTx.Sender, results)
+}
+
+// hasNoCode returns true if the given address has no code (is an EOA).
+// It follows EIP-7702 delegation designators to check the delegated code.
+func hasNoCode(statedb *state.StateDB, addr common.Address) bool {
+	code := statedb.GetCode(addr)
+	if len(code) == 0 {
+		return true
+	}
+	if target, ok := types.ParseDelegation(code); ok {
+		return len(statedb.GetCode(target)) == 0
+	}
+	return false
 }
 
 // verifyResult records the approval scope and target of a simulated VERIFY frame.

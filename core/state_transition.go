@@ -852,12 +852,15 @@ func (st *stateTransition) executeFrames() (common.Address, []uint8, []uint64, [
 		snapshot := st.state.Snapshot()
 
 		// Execute the frame.
+		// If the target has no code (EOA), use the default code logic per EIP-8141.
 		var (
 			ret         []byte
 			leftOverGas uint64
 			vmerr       error
 		)
-		if frame.Mode == types.FrameModeVerify {
+		if st.hasNoCode(target) {
+			ret, leftOverGas, vmerr = vm.ExecuteDefaultCode(st.evm, caller, target, frame.Data, frame.GasLimit, frame.Mode)
+		} else if frame.Mode == types.FrameModeVerify {
 			ret, leftOverGas, vmerr = st.evm.StaticCall(caller, target, frame.Data, frame.GasLimit)
 		} else {
 			ret, leftOverGas, vmerr = st.evm.Call(caller, target, frame.Data, frame.GasLimit, new(uint256.Int))
@@ -874,7 +877,8 @@ func (st *stateTransition) executeFrames() (common.Address, []uint8, []uint64, [
 
 		// Determine frame result and handle approval logic.
 		if vmerr != nil {
-			// Frame execution failed.
+			// Frame execution failed — revert all state changes from this frame.
+			st.state.RevertToSnapshot(snapshot)
 			frameCtx.FrameResults[i] = 0
 		} else if approveStatus >= vm.ApproveExecution && approveStatus <= vm.ApproveBoth {
 			// APPROVE was called. Process approval rules.
@@ -949,6 +953,21 @@ func (st *stateTransition) executeFrames() (common.Address, []uint8, []uint64, [
 	st.gasRemaining -= totalGasUsed
 
 	return payer, frameResults, frameGasUsed, frameLogRanges, nil
+}
+
+// hasNoCode returns true if the given address has no code (is an EOA).
+// It follows EIP-7702 delegation designators to check the delegated code.
+func (st *stateTransition) hasNoCode(addr common.Address) bool {
+	code := st.state.GetCode(addr)
+	if len(code) == 0 {
+		return true
+	}
+	// Follow EIP-7702 delegation: if the code is a delegation designator,
+	// resolve the target and check if *that* has code.
+	if target, ok := types.ParseDelegation(code); ok {
+		return len(st.state.GetCode(target)) == 0
+	}
+	return false
 }
 
 // collectGasFromPayer charges the total transaction gas cost from the payer account.
