@@ -70,6 +70,36 @@ func buildEOAVerifyData(scope uint8, sigHash common.Hash, key *ecdsa.PrivateKey)
 	return data
 }
 
+func buildFalconEOAVerifyData(scope uint8, sigType byte, pubKey, sig []byte) []byte {
+	byte0 := (scope << 4) | 0x01
+	data := make([]byte, 2+len(pubKey)+len(sig))
+	data[0] = byte0
+	data[1] = sigType
+	copy(data[2:2+len(pubKey)], pubKey)
+	copy(data[2+len(pubKey):], sig)
+	return data
+}
+
+func deriveFalconEOAAddress(algType byte, pubKey []byte) common.Address {
+	addrInput := make([]byte, 1+len(pubKey))
+	addrInput[0] = algType
+	copy(addrInput[1:], pubKey)
+	addrHash := crypto.Keccak256(addrInput)
+	return common.BytesToAddress(addrHash[12:])
+}
+
+func testFalconEOAMaterial() ([]byte, []byte) {
+	pubKey := make([]byte, 896)
+	sig := make([]byte, 666)
+	for i := range pubKey {
+		pubKey[i] = byte(i)
+	}
+	for i := range sig {
+		sig[i] = byte(255 - i)
+	}
+	return pubKey, sig
+}
+
 // buildEOASenderData builds the frame.data for EOA default code SENDER mode.
 //
 // Layout: [byte0, RLP-encoded [[target, value, data], ...]]
@@ -126,8 +156,8 @@ func TestEOADefaultCodeSimple(t *testing.T) {
 		Nonce:   0,
 		Sender:  sender,
 		Frames: []types.Frame{
-			{Mode: types.FrameModeVerify, Target: nil, GasLimit: 100000, Data: nil},       // placeholder
-			{Mode: types.FrameModeSender, Target: nil, GasLimit: 100000, Data: nil},        // placeholder
+			{Mode: types.FrameModeVerify, Target: nil, GasLimit: 100000, Data: nil}, // placeholder
+			{Mode: types.FrameModeSender, Target: nil, GasLimit: 100000, Data: nil}, // placeholder
 		},
 		GasTipCap:  uint256.NewInt(1),
 		GasFeeCap:  uint256.NewInt(uint64(params.InitialBaseFee)),
@@ -209,6 +239,132 @@ func TestEOADefaultCodeVerifyOnly(t *testing.T) {
 	if got := statedb.GetNonce(sender); got != 1 {
 		t.Fatalf("sender nonce: got %d, want 1", got)
 	}
+}
+
+func TestEOADefaultCodeFalcon(t *testing.T) {
+	evm, statedb, config := newFrameTestEnv()
+
+	pubKey, sig := testFalconEOAMaterial()
+	sender := deriveFalconEOAAddress(0xFA, pubKey)
+
+	statedb.CreateAccount(sender)
+	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
+
+	ftx := &types.FrameTx{
+		ChainID: uint256.NewInt(config.ChainID.Uint64()),
+		Nonce:   0,
+		Sender:  sender,
+		Frames: []types.Frame{
+			{Mode: types.FrameModeVerify, Target: nil, GasLimit: 100000, Data: buildFalconEOAVerifyData(2, 0x04, pubKey, sig)},
+		},
+		GasTipCap:  uint256.NewInt(1),
+		GasFeeCap:  uint256.NewInt(uint64(params.InitialBaseFee)),
+		BlobFeeCap: new(uint256.Int),
+	}
+
+	msg := makeFrameMsg(ftx, config, big.NewInt(params.InitialBaseFee))
+	result, err := applyFrameTx(evm, config, msg)
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if result.Failed() {
+		t.Fatalf("execution result failed: %v", result.Err)
+	}
+	if got := statedb.GetNonce(sender); got != 1 {
+		t.Fatalf("sender nonce: got %d, want 1", got)
+	}
+}
+
+func TestEOADefaultCodeFalconEth(t *testing.T) {
+	evm, statedb, config := newFrameTestEnv()
+
+	pubKey, sig := testFalconEOAMaterial()
+	sender := deriveFalconEOAAddress(0xFB, pubKey)
+
+	statedb.CreateAccount(sender)
+	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
+
+	ftx := &types.FrameTx{
+		ChainID: uint256.NewInt(config.ChainID.Uint64()),
+		Nonce:   0,
+		Sender:  sender,
+		Frames: []types.Frame{
+			{Mode: types.FrameModeVerify, Target: nil, GasLimit: 100000, Data: buildFalconEOAVerifyData(2, 0x05, pubKey, sig)},
+		},
+		GasTipCap:  uint256.NewInt(1),
+		GasFeeCap:  uint256.NewInt(uint64(params.InitialBaseFee)),
+		BlobFeeCap: new(uint256.Int),
+	}
+
+	msg := makeFrameMsg(ftx, config, big.NewInt(params.InitialBaseFee))
+	result, err := applyFrameTx(evm, config, msg)
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if result.Failed() {
+		t.Fatalf("execution result failed: %v", result.Err)
+	}
+	if got := statedb.GetNonce(sender); got != 1 {
+		t.Fatalf("sender nonce: got %d, want 1", got)
+	}
+}
+
+func TestEOADefaultCodeFalconWrongAddress(t *testing.T) {
+	evm, statedb, config := newFrameTestEnv()
+
+	pubKey, sig := testFalconEOAMaterial()
+	sender := common.HexToAddress("0x9999")
+
+	statedb.CreateAccount(sender)
+	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
+
+	ftx := &types.FrameTx{
+		ChainID: uint256.NewInt(config.ChainID.Uint64()),
+		Nonce:   0,
+		Sender:  sender,
+		Frames: []types.Frame{
+			{Mode: types.FrameModeVerify, Target: nil, GasLimit: 100000, Data: buildFalconEOAVerifyData(2, 0x04, pubKey, sig)},
+		},
+		GasTipCap:  uint256.NewInt(1),
+		GasFeeCap:  uint256.NewInt(uint64(params.InitialBaseFee)),
+		BlobFeeCap: new(uint256.Int),
+	}
+
+	msg := makeFrameMsg(ftx, config, big.NewInt(params.InitialBaseFee))
+	_, err := applyFrameTx(evm, config, msg)
+	if err == nil {
+		t.Fatal("expected error for Falcon EOA address mismatch")
+	}
+	t.Logf("got expected error: %v", err)
+}
+
+func TestEOADefaultCodeFalconInvalidDataLength(t *testing.T) {
+	evm, statedb, config := newFrameTestEnv()
+
+	pubKey, _ := testFalconEOAMaterial()
+	sender := deriveFalconEOAAddress(0xFA, pubKey)
+
+	statedb.CreateAccount(sender)
+	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
+
+	ftx := &types.FrameTx{
+		ChainID: uint256.NewInt(config.ChainID.Uint64()),
+		Nonce:   0,
+		Sender:  sender,
+		Frames: []types.Frame{
+			{Mode: types.FrameModeVerify, Target: nil, GasLimit: 100000, Data: append([]byte{0x21, 0x04}, make([]byte, 10)...)},
+		},
+		GasTipCap:  uint256.NewInt(1),
+		GasFeeCap:  uint256.NewInt(uint64(params.InitialBaseFee)),
+		BlobFeeCap: new(uint256.Int),
+	}
+
+	msg := makeFrameMsg(ftx, config, big.NewInt(params.InitialBaseFee))
+	_, err := applyFrameTx(evm, config, msg)
+	if err == nil {
+		t.Fatal("expected error for invalid Falcon data length")
+	}
+	t.Logf("got expected error: %v", err)
 }
 
 // TestEOADefaultCodeWrongSigner tests that an ECDSA signature from a different key fails.
@@ -350,9 +506,9 @@ func TestEOADefaultCodeSplitApproval(t *testing.T) {
 		Nonce:   0,
 		Sender:  sender,
 		Frames: []types.Frame{
-			{Mode: types.FrameModeVerify, Target: nil, GasLimit: 100000, Data: nil},         // EOA VERIFY
-			{Mode: types.FrameModeVerify, Target: &sponsor, GasLimit: 100000, Data: nil},    // Sponsor VERIFY
-			{Mode: types.FrameModeSender, Target: nil, GasLimit: 100000, Data: nil},          // SENDER call
+			{Mode: types.FrameModeVerify, Target: nil, GasLimit: 100000, Data: nil},      // EOA VERIFY
+			{Mode: types.FrameModeVerify, Target: &sponsor, GasLimit: 100000, Data: nil}, // Sponsor VERIFY
+			{Mode: types.FrameModeSender, Target: nil, GasLimit: 100000, Data: nil},      // SENDER call
 		},
 		GasTipCap:  uint256.NewInt(1),
 		GasFeeCap:  uint256.NewInt(uint64(params.InitialBaseFee)),

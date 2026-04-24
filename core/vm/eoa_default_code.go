@@ -17,6 +17,7 @@
 package vm
 
 import (
+	"bytes"
 	"math/big"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -32,6 +33,18 @@ import (
 const (
 	sigTypeSecp256k1 = 0x00
 	sigTypeP256      = 0x01
+	sigTypeFalcon    = 0x04
+	sigTypeFalconEth = 0x05
+)
+
+const (
+	falconAlgType    = 0xFA
+	falconEthAlgType = 0xFB
+
+	falconMsgSize   = 32
+	falconSigSize   = 666
+	falconPKSize    = 896
+	falconInputSize = 2 + falconPKSize + falconSigSize
 )
 
 // Gas costs for EOA default code operations.
@@ -108,6 +121,10 @@ func executeDefaultVerify(evm *EVM, target common.Address, input []byte, gas uin
 		return verifySecp256k1(evm, target, input, gas, scope)
 	case sigTypeP256:
 		return verifyP256(evm, target, input, gas, scope)
+	case sigTypeFalcon:
+		return verifyFalconEOA(evm, target, input, gas, scope, false)
+	case sigTypeFalconEth:
+		return verifyFalconEOA(evm, target, input, gas, scope, true)
 	default:
 		return nil, gas, ErrExecutionReverted
 	}
@@ -233,6 +250,74 @@ func verifyP256(evm *EVM, target common.Address, input []byte, gas uint64, scope
 
 	// Set APPROVE.
 	return applyDefaultApprove(evm, target, scope, gas)
+}
+
+// verifyFalconEOA verifies a Falcon signature for EOA default code.
+//
+// Data layout: [byte0, sig_type, pubkey(896), sig(666)] = 1564 bytes total
+// hash = keccak256(sig_hash || data_without_signature)
+// data_without_signature = input[:2] (the 2 header bytes)
+// target must equal keccak256(ALG_TYPE || pubkey)[12:]
+func verifyFalconEOA(evm *EVM, target common.Address, input []byte, gas uint64, scope uint8, useKeccak bool) ([]byte, uint64, error) {
+	if len(input) != falconInputSize {
+		return nil, gas, ErrExecutionReverted
+	}
+
+	// Charge keccak gas: two keccak calls.
+	// 1) hash = keccak256(sig_hash || data_without_sig): 34 bytes = 2 words
+	// 2) addr = keccak256(ALG_TYPE || pubkey): 897 bytes = 29 words
+	keccakGas := 2*params.Keccak256Gas + (2+29)*params.Keccak256WordGas
+	if gas < keccakGas {
+		return nil, 0, ErrOutOfGas
+	}
+	gas -= keccakGas
+
+	algType := byte(falconAlgType)
+	precompileAddr := common.BytesToAddress([]byte{0x14})
+	if useKeccak {
+		algType = falconEthAlgType
+		precompileAddr = common.BytesToAddress([]byte{0x15})
+	}
+
+	fc := evm.FrameCtx
+	sigHash := fc.SigHash
+
+	pubKey := input[2 : 2+falconPKSize]
+	sig := input[2+falconPKSize:]
+	dataWithoutSig := input[:2]
+
+	// Verify target == keccak256(ALG_TYPE || pubkey)[12:].
+	addrInput := make([]byte, 1+len(pubKey))
+	addrInput[0] = algType
+	copy(addrInput[1:], pubKey)
+	addrHash := crypto.Keccak256(addrInput)
+	derivedAddr := common.BytesToAddress(addrHash[12:])
+	if derivedAddr != target {
+		return nil, gas, ErrExecutionReverted
+	}
+
+	// hash = keccak256(sig_hash || data_without_signature)
+	hashInput := make([]byte, 32+len(dataWithoutSig))
+	copy(hashInput, sigHash[:])
+	copy(hashInput[32:], dataWithoutSig)
+	hash := crypto.Keccak256(hashInput)
+
+	// VERIFY_FALCON input: msg(32B) || sig(666B) || pubkey(896B)
+	precompileInput := make([]byte, falconMsgSize+falconSigSize+falconPKSize)
+	copy(precompileInput[0:falconMsgSize], hash)
+	copy(precompileInput[falconMsgSize:falconMsgSize+falconSigSize], sig)
+	copy(precompileInput[falconMsgSize+falconSigSize:], pubKey)
+
+	ret, remainingGas, err := evm.StaticCall(target, precompileAddr, precompileInput, gas)
+	if err != nil {
+		return nil, remainingGas, err
+	}
+	if !bytes.Equal(ret, true32Byte) {
+		return nil, remainingGas, ErrExecutionReverted
+	}
+
+	// Set APPROVE.
+	return applyDefaultApprove(evm, target, scope, remainingGas)
 }
 
 // applyDefaultApprove sets the APPROVE status on the EVM, mirroring what
