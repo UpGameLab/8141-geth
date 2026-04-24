@@ -25,33 +25,97 @@ import (
 )
 
 func TestFalconPrecompileGasAndName(t *testing.T) {
-	p := &verifyFalcon{}
-	if got := p.RequiredGas(nil); got != params.VerifyFalconGas {
-		t.Fatalf("unexpected gas: got %d want %d", got, params.VerifyFalconGas)
+	tests := []struct {
+		name string
+		p    PrecompiledContract
+		want string
+	}{
+		{
+			name: "shake256",
+			p:    &verifyFalcon{},
+			want: "VERIFY_FALCON",
+		},
+		{
+			name: "keccak",
+			p:    &verifyFalconEth{},
+			want: "VERIFY_FALCON_ETH",
+		},
 	}
-	if got := p.Name(); got != "VERIFY_FALCON" {
-		t.Fatalf("unexpected name: got %s", got)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.p.RequiredGas(nil); got != params.VerifyFalconGas {
+				t.Fatalf("unexpected gas: got %d want %d", got, params.VerifyFalconGas)
+			}
+			if got := tt.p.Name(); got != tt.want {
+				t.Fatalf("unexpected name: got %s want %s", got, tt.want)
+			}
+		})
 	}
 }
 
 func TestFalconPrecompileReturnsTrue(t *testing.T) {
-	p := &verifyFalcon{}
-	ret, err := p.Run([]byte{0x01, 0x02, 0x03})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	tests := []struct {
+		name string
+		p    PrecompiledContract
+	}{
+		{
+			name: "shake256",
+			p:    &verifyFalcon{},
+		},
+		{
+			name: "keccak",
+			p:    &verifyFalconEth{},
+		},
 	}
-	if !bytes.Equal(ret, true32Byte) {
-		t.Fatalf("unexpected return value: got %x", ret)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ret, err := tt.p.Run([]byte{0x01, 0x02, 0x03})
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if !bytes.Equal(ret, true32Byte) {
+				t.Fatalf("unexpected return value: got %x", ret)
+			}
+		})
 	}
 }
 
 func TestFalconPrecompileRegisteredInOsaka(t *testing.T) {
-	addr := common.BytesToAddress([]byte{0x14})
-	p, ok := PrecompiledContractsOsaka[addr]
-	if !ok {
-		t.Fatalf("falcon precompile not registered at 0x14")
+	tests := []struct {
+		addr byte
+		name string
+	}{
+		{addr: 0x14, name: "VERIFY_FALCON"},
+		{addr: 0x15, name: "VERIFY_FALCON_ETH"},
 	}
-	if p.Name() != "VERIFY_FALCON" {
-		t.Fatalf("unexpected precompile at 0x14: %s", p.Name())
+	for _, tt := range tests {
+		addr := common.BytesToAddress([]byte{tt.addr})
+		p, ok := PrecompiledContractsOsaka[addr]
+		if !ok {
+			t.Fatalf("falcon precompile not registered at %#x", tt.addr)
+		}
+		if p.Name() != tt.name {
+			t.Fatalf("unexpected precompile at %#x: got %s want %s", tt.addr, p.Name(), tt.name)
+		}
+	}
+}
+
+func TestFalconPrecompileExportedSet(t *testing.T) {
+	tests := []struct {
+		addr byte
+		name string
+	}{
+		{addr: 0x14, name: "VERIFY_FALCON"},
+		{addr: 0x15, name: "VERIFY_FALCON_ETH"},
+	}
+	for _, tt := range tests {
+		addr := common.BytesToAddress([]byte{tt.addr})
+		p, ok := PrecompiledContractsFalcon[addr]
+		if !ok {
+			t.Fatalf("falcon precompile not exported at %#x", tt.addr)
+		}
+		if p.Name() != tt.name {
+			t.Fatalf("unexpected exported precompile at %#x: got %s want %s", tt.addr, p.Name(), tt.name)
+		}
 	}
 }
