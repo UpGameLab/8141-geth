@@ -1,3 +1,9 @@
+---
+name: Feature / 기능
+about: 기능 추가 및 구현
+labels: enhancement
+---
+
 ## 목표
 <!-- 이 이슈의 목표를 간략히 설명해주세요 -->
 
