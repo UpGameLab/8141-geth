@@ -170,6 +170,8 @@ var PrecompiledContractsOsaka = PrecompiledContracts{
 
 	common.BytesToAddress([]byte{0x12}): &verifyMLDSA{},
 	common.BytesToAddress([]byte{0x13}): &verifyMLDSAEth{},
+	common.BytesToAddress([]byte{0x14}): &verifyFalcon{},
+	common.BytesToAddress([]byte{0x15}): &verifyFalconEth{},
 
 	common.BytesToAddress([]byte{0x1, 0x00}): &p256Verify{},
 }
@@ -185,6 +187,13 @@ var PrecompiledContractsP256Verify = PrecompiledContracts{
 var PrecompiledContractsMLDSA = PrecompiledContracts{
 	common.BytesToAddress([]byte{0x12}): &verifyMLDSA{},
 	common.BytesToAddress([]byte{0x13}): &verifyMLDSAEth{},
+}
+
+// PrecompiledContractsFalcon contains the Falcon stub precompiled Ethereum
+// contracts. This is exported for testing purposes.
+var PrecompiledContractsFalcon = PrecompiledContracts{
+	common.BytesToAddress([]byte{0x14}): &verifyFalcon{},
+	common.BytesToAddress([]byte{0x15}): &verifyFalconEth{},
 }
 
 var (
