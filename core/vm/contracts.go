@@ -189,8 +189,8 @@ var PrecompiledContractsMLDSA = PrecompiledContracts{
 	common.BytesToAddress([]byte{0x13}): &verifyMLDSAEth{},
 }
 
-// PrecompiledContractsFalcon contains the Falcon stub precompiled Ethereum
-// contracts. This is exported for testing purposes.
+// PrecompiledContractsFalcon contains the Falcon-512 precompiled contracts.
+// This is exported for testing purposes.
 var PrecompiledContractsFalcon = PrecompiledContracts{
 	common.BytesToAddress([]byte{0x14}): &verifyFalcon{},
 	common.BytesToAddress([]byte{0x15}): &verifyFalconEth{},
