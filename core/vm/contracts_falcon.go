@@ -27,12 +27,17 @@ const (
 	// Norm bound: valid signatures satisfy ‖(s1,s2)‖² ≤ falconBetaSq.
 	falconBetaSq int64 = 34034726
 
-	// Input layout (no wire-format headers; caller provides raw fields).
-	falconMsgSize   = 32  // message hash
-	falconNonceSize = 40  // HashToPoint nonce r
-	falconSigSize   = 625 // padded compressed s2 (FALCONPADDED512 − 1 hdr − 40 nonce)
-	falconPKSize    = 896 // h polynomial: falconN coefficients × 14 bits = 896 bytes
-	falconInputSize = falconMsgSize + falconNonceSize + falconSigSize + falconPKSize // 1593
+	// Input layout matches EOA routing: msg ‖ FALCONPADDED512_sig ‖ pk.
+	falconMsgSize     = 32  // message hash
+	falconNonceSize   = 40  // HashToPoint nonce r (inside sig wire format)
+	falconSigBodySize = 625 // padded compressed s2 (inside sig wire format)
+	falconSigHdrSize  = 1   // FALCONPADDED512 header byte (0x39 for n=512)
+	falconSigSize     = falconSigHdrSize + falconNonceSize + falconSigBodySize // 666
+	falconPKSize      = 896 // h polynomial: falconN coefficients × 14 bits = 896 bytes
+	falconInputSize   = falconMsgSize + falconSigSize + falconPKSize           // 1594
+
+	// FALCONPADDED512 header byte: type=padded(0b0011), logn=9 → 0x39.
+	falconSigHeader = 0x39
 )
 
 // ---------------------------------------------------------------------------
@@ -68,10 +73,16 @@ func verifyFalconCore(input []byte, useKeccak bool) ([]byte, error) {
 		return nil, nil
 	}
 
-	msg    := input[:falconMsgSize]
-	nonce  := input[falconMsgSize : falconMsgSize+falconNonceSize]
-	sigRaw := input[falconMsgSize+falconNonceSize : falconMsgSize+falconNonceSize+falconSigSize]
-	pkRaw  := input[falconMsgSize+falconNonceSize+falconSigSize:]
+	msg   := input[:falconMsgSize]
+	sig   := input[falconMsgSize : falconMsgSize+falconSigSize]
+	pkRaw := input[falconMsgSize+falconSigSize:]
+
+	// Validate FALCONPADDED512 header byte.
+	if sig[0] != falconSigHeader {
+		return false32Byte, nil
+	}
+	nonce  := sig[falconSigHdrSize : falconSigHdrSize+falconNonceSize]
+	sigRaw := sig[falconSigHdrSize+falconNonceSize:]
 
 	// 1. Decode public key h ∈ Z_q[x]/(x^n+1).
 	h, ok := falconDecodePK(pkRaw)

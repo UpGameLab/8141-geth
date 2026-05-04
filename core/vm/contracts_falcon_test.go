@@ -206,9 +206,9 @@ func TestFalconDecodePKRejectsQOrAbove(t *testing.T) {
 
 // buildCompressedSig packs a slice of signed coefficients into the Falcon
 // compressed format: sign(1) | low7(7) | unary(|v|>>7) for each coefficient.
-// The result is zero-padded to falconSigSize bytes.
+// The result is zero-padded to falconSigBodySize bytes.
 func buildCompressedSig(coeffs [falconN]int32) []byte {
-	buf := make([]byte, falconSigSize)
+	buf := make([]byte, falconSigBodySize)
 	acc := uint64(0)
 	accLen := uint(0)
 	putBit := func(b uint64) {
@@ -311,7 +311,7 @@ func TestFalconDecompressSigRoundTrip(t *testing.T) {
 func TestFalconDecompressSigRejectsNegativeZero(t *testing.T) {
 	// Construct a signature where the first coefficient is "negative zero":
 	// sign=1, low7=0, high=0 → encoded as 1(sign) 0000000(low7) 1(stop).
-	buf := make([]byte, falconSigSize)
+	buf := make([]byte, falconSigBodySize)
 	// First byte: bit0=sign=1, bits1-7=low7=0, bit8=stop=1
 	// bit 0 = sign = 1, bits 1-7 = low7 = 0 → byte0 = 0b00000001 = 0x01
 	// bit 8 = stop = 1 → byte1, bit 0 = 1 → byte1 = 0x01
@@ -327,7 +327,7 @@ func TestFalconDecompressSigRejectsNonZeroPadding(t *testing.T) {
 	var coeffs [falconN]int32
 	sig := buildCompressedSig(coeffs)
 	// Corrupt the last byte to have a non-zero trailing bit.
-	sig[falconSigSize-1] |= 0x80
+	sig[falconSigBodySize-1] |= 0x80
 	_, ok := falconDecompressSig(sig)
 	if ok {
 		t.Fatal("non-zero padding should be rejected")
@@ -566,7 +566,7 @@ func TestFalconVerifyValidSig(t *testing.T) {
 	}
 }
 
-// TestFalconVerifyPrecompileE2E builds a complete 1593-byte input where
+// TestFalconVerifyPrecompileE2E builds a complete 1594-byte input where
 // nonce+msg determine c via HashToPoint, and assembles a valid (s1, s2, h)
 // tuple accordingly.
 func TestFalconVerifyPrecompileE2E(t *testing.T) {
