@@ -29,22 +29,31 @@ func TestFalconPrecompileGasAndName(t *testing.T) {
 		name string
 		p    PrecompiledContract
 		want string
+		gas  uint64
 	}{
 		{
-			name: "shake256",
-			p:    &verifyFalcon{},
-			want: "VERIFY_FALCON",
+			name: "hash-to-point-shake256",
+			p:    &falconHashToPointShake256{},
+			want: "FALCON_HASH_TO_POINT_SHAKE256",
+			gas:  params.FalconHashToPointGas,
 		},
 		{
-			name: "keccak",
-			p:    &verifyFalconEth{},
-			want: "VERIFY_FALCON_ETH",
+			name: "hash-to-point-keccakprng",
+			p:    &falconHashToPointKeccakPRNG{},
+			want: "FALCON_HASH_TO_POINT_KECCAKPRNG",
+			gas:  params.FalconHashToPointGas,
+		},
+		{
+			name: "core",
+			p:    &falconCore{},
+			want: "FALCON_CORE",
+			gas:  params.FalconCoreGas,
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := tt.p.RequiredGas(nil); got != params.VerifyFalconGas {
-				t.Fatalf("unexpected gas: got %d want %d", got, params.VerifyFalconGas)
+			if got := tt.p.RequiredGas(nil); got != tt.gas {
+				t.Fatalf("unexpected gas: got %d want %d", got, tt.gas)
 			}
 			if got := tt.p.Name(); got != tt.want {
 				t.Fatalf("unexpected name: got %s want %s", got, tt.want)
@@ -53,28 +62,68 @@ func TestFalconPrecompileGasAndName(t *testing.T) {
 	}
 }
 
-func TestFalconPrecompileReturnsTrue(t *testing.T) {
+func TestFalconHashToPointPrecompilesReturnChallenge(t *testing.T) {
 	tests := []struct {
 		name string
 		p    PrecompiledContract
 	}{
 		{
-			name: "shake256",
-			p:    &verifyFalcon{},
+			name: "hash-to-point-shake256",
+			p:    &falconHashToPointShake256{},
 		},
 		{
-			name: "keccak",
-			p:    &verifyFalconEth{},
+			name: "hash-to-point-keccakprng",
+			p:    &falconHashToPointKeccakPRNG{},
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			ret, err := tt.p.Run([]byte{0x01, 0x02, 0x03})
+			ret, err := tt.p.Run(make([]byte, falconHashToPointInputSize))
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
-			if !bytes.Equal(ret, true32Byte) {
-				t.Fatalf("unexpected return value: got %x", ret)
+			if len(ret) != falconChallengeSize {
+				t.Fatalf("unexpected challenge size: got %d want %d", len(ret), falconChallengeSize)
+			}
+			if !bytes.Equal(ret, make([]byte, falconChallengeSize)) {
+				t.Fatalf("unexpected challenge value: got %x", ret)
+			}
+		})
+	}
+}
+
+func TestFalconCorePrecompileReturnsTrue(t *testing.T) {
+	ret, err := (&falconCore{}).Run(make([]byte, falconCoreInputSize))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !bytes.Equal(ret, true32Byte) {
+		t.Fatalf("unexpected return value: got %x", ret)
+	}
+}
+
+func TestFalconPrecompilesRejectInvalidInputLength(t *testing.T) {
+	tests := []struct {
+		name string
+		p    PrecompiledContract
+	}{
+		{
+			name: "hash-to-point-shake256",
+			p:    &falconHashToPointShake256{},
+		},
+		{
+			name: "hash-to-point-keccakprng",
+			p:    &falconHashToPointKeccakPRNG{},
+		},
+		{
+			name: "core",
+			p:    &falconCore{},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := tt.p.Run([]byte{0x01, 0x02, 0x03}); err == nil {
+				t.Fatal("expected invalid input length error")
 			}
 		})
 	}
@@ -85,8 +134,9 @@ func TestFalconPrecompileRegisteredInOsaka(t *testing.T) {
 		addr byte
 		name string
 	}{
-		{addr: 0x14, name: "VERIFY_FALCON"},
-		{addr: 0x15, name: "VERIFY_FALCON_ETH"},
+		{addr: 0x14, name: "FALCON_HASH_TO_POINT_SHAKE256"},
+		{addr: 0x15, name: "FALCON_HASH_TO_POINT_KECCAKPRNG"},
+		{addr: 0x16, name: "FALCON_CORE"},
 	}
 	for _, tt := range tests {
 		addr := common.BytesToAddress([]byte{tt.addr})
@@ -105,8 +155,9 @@ func TestFalconPrecompileExportedSet(t *testing.T) {
 		addr byte
 		name string
 	}{
-		{addr: 0x14, name: "VERIFY_FALCON"},
-		{addr: 0x15, name: "VERIFY_FALCON_ETH"},
+		{addr: 0x14, name: "FALCON_HASH_TO_POINT_SHAKE256"},
+		{addr: 0x15, name: "FALCON_HASH_TO_POINT_KECCAKPRNG"},
+		{addr: 0x16, name: "FALCON_CORE"},
 	}
 	for _, tt := range tests {
 		addr := common.BytesToAddress([]byte{tt.addr})
