@@ -16,35 +16,72 @@
 
 package vm
 
-import "github.com/ethereum/go-ethereum/params"
+import (
+	"errors"
 
-// verifyFalcon is a stub precompile for Falcon signature verification.
-// It uses NIST-compliant SHAKE256 in the future implementation.
-type verifyFalcon struct{}
+	"github.com/ethereum/go-ethereum/params"
+)
 
-func (c *verifyFalcon) RequiredGas(input []byte) uint64 { return params.VerifyFalconGas }
+const (
+	falconMsgSize       = 32
+	falconSigSize       = 666
+	falconPKSize        = 896
+	falconChallengeSize = 896
 
-func (c *verifyFalcon) Run(input []byte) ([]byte, error) {
-	return verifyFalconCore(input, false)
+	falconHashToPointInputSize = falconMsgSize + falconSigSize
+	falconCoreInputSize        = falconSigSize + falconPKSize + falconChallengeSize
+)
+
+var errFalconInvalidInputLength = errors.New("invalid Falcon precompile input length")
+
+// falconHashToPointShake256 is a stub precompile for EIP-8052
+// FALCON_HASH_TO_POINT_SHAKE256.
+type falconHashToPointShake256 struct{}
+
+func (c *falconHashToPointShake256) RequiredGas(input []byte) uint64 {
+	return params.FalconHashToPointGas
 }
 
-func (c *verifyFalcon) Name() string { return "VERIFY_FALCON" }
-
-// verifyFalconEth is a stub precompile for Falcon signature verification.
-// It uses an EVM-optimized KeccakPRNG in the future implementation.
-type verifyFalconEth struct{}
-
-func (c *verifyFalconEth) RequiredGas(input []byte) uint64 { return params.VerifyFalconGas }
-
-func (c *verifyFalconEth) Run(input []byte) ([]byte, error) {
-	return verifyFalconCore(input, true)
+func (c *falconHashToPointShake256) Run(input []byte) ([]byte, error) {
+	return falconHashToPoint(input, false)
 }
 
-func (c *verifyFalconEth) Name() string { return "VERIFY_FALCON_ETH" }
+func (c *falconHashToPointShake256) Name() string { return "FALCON_HASH_TO_POINT_SHAKE256" }
 
-// verifyFalconCore intentionally does not implement Falcon cryptography yet. It
-// only provides a callable precompile surface so contracts and tooling can
-// integrate against it.
-func verifyFalconCore(input []byte, useKeccak bool) ([]byte, error) {
+// falconHashToPointKeccakPRNG is a stub precompile for EIP-8052
+// FALCON_HASH_TO_POINT_KECCAKPRNG.
+type falconHashToPointKeccakPRNG struct{}
+
+func (c *falconHashToPointKeccakPRNG) RequiredGas(input []byte) uint64 {
+	return params.FalconHashToPointGas
+}
+
+func (c *falconHashToPointKeccakPRNG) Run(input []byte) ([]byte, error) {
+	return falconHashToPoint(input, true)
+}
+
+func (c *falconHashToPointKeccakPRNG) Name() string { return "FALCON_HASH_TO_POINT_KECCAKPRNG" }
+
+// falconCore is a stub precompile for EIP-8052 FALCON_CORE.
+type falconCore struct{}
+
+func (c *falconCore) RequiredGas(input []byte) uint64 { return params.FalconCoreGas }
+
+func (c *falconCore) Run(input []byte) ([]byte, error) {
+	if len(input) != falconCoreInputSize {
+		return nil, errFalconInvalidInputLength
+	}
 	return true32Byte, nil
+}
+
+func (c *falconCore) Name() string { return "FALCON_CORE" }
+
+// falconHashToPoint intentionally does not implement the EIP-8052 hash-to-point
+// algorithms yet. It only enforces the precompile ABI and returns a placeholder
+// challenge so contracts and default-code routing can integrate against it.
+func falconHashToPoint(input []byte, useKeccak bool) ([]byte, error) {
+	if len(input) != falconHashToPointInputSize {
+		return nil, errFalconInvalidInputLength
+	}
+	return make([]byte, falconChallengeSize), nil
 }
