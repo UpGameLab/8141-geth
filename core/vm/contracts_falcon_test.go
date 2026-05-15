@@ -89,20 +89,25 @@ func TestFalconHashToPointPrecompilesReturnChallenge(t *testing.T) {
 			if len(ret) != falconChallengeSize {
 				t.Fatalf("unexpected challenge size: got %d want %d", len(ret), falconChallengeSize)
 			}
-			if !bytes.Equal(ret, make([]byte, falconChallengeSize)) {
-				t.Fatalf("unexpected challenge value: got %x", ret)
+			// Verify each 16-bit LE coefficient is in [0, q-1].
+			for i := 0; i < falconN; i++ {
+				v := uint16(ret[2*i]) | uint16(ret[2*i+1])<<8
+				if int(v) >= falconQ {
+					t.Fatalf("challenge[%d] = %d, out of range [0, q-1]", i, v)
+				}
 			}
 		})
 	}
 }
 
-func TestFalconCorePrecompileReturnsTrue(t *testing.T) {
+func TestFalconCorePrecompileReturnsBool(t *testing.T) {
+	// All-zero input: sig header byte 0x00 ≠ 0x39 → must return false32Byte, not nil.
 	ret, err := (&falconCore{}).Run(make([]byte, falconCoreInputSize))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if !bytes.Equal(ret, true32Byte) {
-		t.Fatalf("unexpected return value: got %x", ret)
+	if !bytes.Equal(ret, false32Byte) {
+		t.Fatalf("expected false32Byte for all-zero input, got %x", ret)
 	}
 }
 
@@ -180,11 +185,21 @@ func TestFalconPrecompileExportedSet(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestFalconInvalidInputLength(t *testing.T) {
-	cases := []int{0, 1, falconInputSize - 1, falconInputSize + 1}
-	for _, l := range cases {
-		ret, err := (&verifyFalcon{}).Run(make([]byte, l))
-		if ret != nil || err != nil {
-			t.Errorf("len=%d: want (nil,nil), got (%v,%v)", l, ret, err)
+	tests := []struct {
+		name  string
+		p     PrecompiledContract
+		valid int
+	}{
+		{"hash-to-point-shake256", &falconHashToPointShake256{}, falconHashToPointInputSize},
+		{"hash-to-point-keccakprng", &falconHashToPointKeccakPRNG{}, falconHashToPointInputSize},
+		{"core", &falconCore{}, falconCoreInputSize},
+	}
+	for _, tt := range tests {
+		for _, l := range []int{0, 1, tt.valid - 1, tt.valid + 1} {
+			ret, err := tt.p.Run(make([]byte, l))
+			if ret != nil || err == nil {
+				t.Errorf("%s len=%d: want (nil,err), got (%v,%v)", tt.name, l, ret, err)
+			}
 		}
 	}
 }
@@ -638,25 +653,20 @@ func TestFalconVerifyPrecompileE2E(t *testing.T) {
 	// and back-calculate the required c, then match nonce/msg to produce that c.
 	// Since we cannot control HashToPoint output, we skip the precompile path
 	// and test the arithmetic path directly (see TestFalconVerifyValidSig).
-	// This test verifies that the precompile wiring (input parsing, dispatch)
-	// returns false32Byte for an all-zero input, not nil.
-	input := make([]byte, falconInputSize)
-	for _, p := range []*verifyFalcon{{}} {
-		ret, err := p.Run(input)
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		if len(ret) != 32 {
-			t.Fatalf("expected 32-byte result, got %d bytes", len(ret))
-		}
-		// All-zero input has PK coeff 0 (valid) and s2 all-zero, so s1 = c.
-		// c from HashToPoint is non-zero; ‖c‖² likely exceeds β². Result = false.
-		// (We only check that it returns 32 bytes, not nil.)
-		_ = ret
+	// This test verifies that FALCON_CORE wiring returns false32Byte for
+	// an all-zero input, not nil.
+	input := make([]byte, falconCoreInputSize)
+	ret, err := (&falconCore{}).Run(input)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
 	}
+	if len(ret) != 32 {
+		t.Fatalf("expected 32-byte result, got %d bytes", len(ret))
+	}
+	// All-zero: sig header byte is 0x00 ≠ 0x39 → immediately returns false32Byte.
+	_ = ret
 
 	// Confirm correct result is exactly false32Byte or true32Byte (not nil).
-	ret, _ := (&verifyFalcon{}).Run(input)
 	if !bytes.Equal(ret, true32Byte) && !bytes.Equal(ret, false32Byte) {
 		t.Fatal("precompile must return exactly true32Byte or false32Byte")
 	}
