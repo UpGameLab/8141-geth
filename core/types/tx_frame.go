@@ -40,40 +40,57 @@ const (
 	FrameModeSender  uint8 = 2 // Execute as tx.sender caller.
 )
 
+// Frame flags as defined in EIP-8141 §3.2.
+const (
+	FrameFlagApproveAll  uint8 = 0x00 // approve any calldata in this slot
+	FrameFlagApproveHash uint8 = 0x01 // approve only if keccak256(data) matches
+)
+
 // Frame represents a single execution frame in a frame transaction (EIP-8141).
 //
-// RLP encoding: [mode, target, gas_limit, data]
+// RLP encoding: [mode, flags, target, gas_limit, value, data]
 // When target is nil, it resolves to tx.sender at execution time.
+// When value is nil, it is treated as zero.
 type Frame struct {
 	Mode     uint8
+	Flags    uint8           // approval scope and constraint bits
 	Target   *common.Address // nil means tx.sender
 	GasLimit uint64
+	Value    *uint256.Int // wei to transfer; nil means zero
 	Data     []byte
 }
 
 // EncodeRLP implements rlp.Encoder for Frame.
-// Nil target is encoded as empty bytes.
+// Nil target is encoded as empty bytes. Nil value is encoded as zero.
 func (f *Frame) EncodeRLP(w io.Writer) error {
 	var target []byte
 	if f.Target != nil {
 		target = f.Target.Bytes()
 	}
-	return rlp.Encode(w, []any{f.Mode, target, f.GasLimit, f.Data})
+	value := f.Value
+	if value == nil {
+		value = uint256.NewInt(0)
+	}
+	return rlp.Encode(w, []any{f.Mode, f.Flags, target, f.GasLimit, value, f.Data})
 }
 
 // DecodeRLP implements rlp.Decoder for Frame.
 func (f *Frame) DecodeRLP(s *rlp.Stream) error {
 	var dec struct {
 		Mode     uint8
+		Flags    uint8
 		Target   []byte
 		GasLimit uint64
+		Value    *uint256.Int
 		Data     []byte
 	}
 	if err := s.Decode(&dec); err != nil {
 		return err
 	}
 	f.Mode = dec.Mode
+	f.Flags = dec.Flags
 	f.GasLimit = dec.GasLimit
+	f.Value = dec.Value
 	f.Data = dec.Data
 	f.Target = nil
 	if len(dec.Target) > 0 {
@@ -136,12 +153,17 @@ func (tx *FrameTx) copy() TxData {
 	for i, f := range tx.Frames {
 		cpy.Frames[i] = Frame{
 			Mode:     f.Mode,
+			Flags:    f.Flags,
 			GasLimit: f.GasLimit,
 			Data:     common.CopyBytes(f.Data),
 		}
 		if f.Target != nil {
 			target := *f.Target
 			cpy.Frames[i].Target = &target
+		}
+		if f.Value != nil {
+			v := new(uint256.Int).Set(f.Value)
+			cpy.Frames[i].Value = v
 		}
 	}
 	copy(cpy.BlobHashes, tx.BlobHashes)
@@ -263,16 +285,20 @@ func (tx *FrameTx) sigHash(chainID *big.Int) common.Hash {
 	// Build frames with VERIFY data elided.
 	type frameSigHash struct {
 		Mode     uint8
+		Flags    uint8
 		Target   *common.Address
 		GasLimit uint64
+		Value    *uint256.Int
 		Data     []byte
 	}
 	frames := make([]frameSigHash, len(tx.Frames))
 	for i, f := range tx.Frames {
 		frames[i] = frameSigHash{
 			Mode:     f.Mode,
+			Flags:    f.Flags,
 			Target:   f.Target,
 			GasLimit: f.GasLimit,
+			Value:    f.Value,
 		}
 		if f.Mode != FrameModeVerify {
 			frames[i].Data = f.Data
