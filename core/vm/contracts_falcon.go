@@ -16,99 +16,126 @@
 
 package vm
 
-import "github.com/ethereum/go-ethereum/params"
-
-// Falcon-512 parameters (NIST submission, round 3).
-const (
-	falconN    = 512
-	falconQ    = 12289
-	falconLogN = 9
-
-	// Norm bound: valid signatures satisfy ‖(s1,s2)‖² ≤ falconBetaSq.
-	falconBetaSq int64 = 34034726
-
-	// Input layout matches EOA routing: msg ‖ FALCONPADDED512_sig ‖ pk.
-	falconMsgSize     = 32  // message hash
-	falconNonceSize   = 40  // HashToPoint nonce r (inside sig wire format)
-	falconSigBodySize = 625 // padded compressed s2 (inside sig wire format)
-	falconSigHdrSize  = 1   // FALCONPADDED512 header byte (0x39 for n=512)
-	falconSigSize     = falconSigHdrSize + falconNonceSize + falconSigBodySize // 666
-	falconPKSize      = 896 // h polynomial: falconN coefficients × 14 bits = 896 bytes
-	falconInputSize   = falconMsgSize + falconSigSize + falconPKSize           // 1594
-
-	// FALCONPADDED512 header byte: type=padded(0b0011), logn=9 → 0x39.
-	falconSigHeader = 0x39
+import (
+	"errors"
+	"github.com/ethereum/go-ethereum/params"
 )
 
-// ---------------------------------------------------------------------------
-// Precompile structs
-// ---------------------------------------------------------------------------
+const (
+  falconN           = 512
+  falconQ           = 12289
+  falconBetaSq      int64 = 34034726
+  falconNonceSize   = 40
+  falconSigBodySize = 625
+  falconSigHdrSize  = 1
+  falconSigHeader   = 0x39
+	falconMsgSize       = 32
+	falconSigSize       = 666
+	falconPKSize        = 896
+	falconChallengeSize = 896
 
-// verifyFalcon implements Falcon-512 verification at address 0x14.
-// Uses NIST-compliant SHAKE256 for HashToPoint.
-type verifyFalcon struct{}
+	falconHashToPointInputSize = falconMsgSize + falconSigSize
+	falconCoreInputSize        = falconSigSize + falconPKSize + falconChallengeSize
+)
 
-func (c *verifyFalcon) RequiredGas(_ []byte) uint64 { return params.VerifyFalconGas }
-func (c *verifyFalcon) Run(input []byte) ([]byte, error) {
-	return verifyFalconCore(input, false)
+var errFalconInvalidInputLength = errors.New("invalid Falcon precompile input length")
+
+// falconHashToPointShake256 is a stub precompile for EIP-8052
+// FALCON_HASH_TO_POINT_SHAKE256.
+type falconHashToPointShake256 struct{}
+
+func (c *falconHashToPointShake256) RequiredGas(input []byte) uint64 {
+	return params.FalconHashToPointGas
 }
-func (c *verifyFalcon) Name() string { return "VERIFY_FALCON" }
 
-// verifyFalconEth implements Falcon-512 verification at address 0x15.
-// Uses Keccak-based PRNG instead of SHAKE256 for EVM efficiency.
-type verifyFalconEth struct{}
-
-func (c *verifyFalconEth) RequiredGas(_ []byte) uint64 { return params.VerifyFalconGas }
-func (c *verifyFalconEth) Run(input []byte) ([]byte, error) {
-	return verifyFalconCore(input, true)
-}
-func (c *verifyFalconEth) Name() string { return "VERIFY_FALCON_ETH" }
-
-// ---------------------------------------------------------------------------
-// Core verification (Falcon spec §3.11.3)
-// ---------------------------------------------------------------------------
-
-func verifyFalconCore(input []byte, useKeccak bool) ([]byte, error) {
-	if len(input) != falconInputSize {
-		return nil, nil
+func (c *falconHashToPointShake256) Run(input []byte) ([]byte, error) {
+	if len(input) != falconHashToPointInputSize {
+		return nil, errFalconInvalidInputLength
 	}
-
 	msg   := input[:falconMsgSize]
-	sig   := input[falconMsgSize : falconMsgSize+falconSigSize]
-	pkRaw := input[falconMsgSize+falconSigSize:]
+	nonce := input[falconMsgSize+falconSigHdrSize : falconMsgSize+falconSigHdrSize+falconNonceSize]
+	poly  := falconHashToPoint(nonce, msg, false)
+	out   := make([]byte, falconChallengeSize)
+	for i, v := range poly {
+		out[2*i]   = byte(uint16(v))
+		out[2*i+1] = byte(uint16(v) >> 8)
+	}
+	return out, nil
+}
 
-	// Validate FALCONPADDED512 header byte.
+
+func (c *falconHashToPointShake256) Name() string { return "FALCON_HASH_TO_POINT_SHAKE256" }
+
+// falconHashToPointKeccakPRNG is a stub precompile for EIP-8052
+// FALCON_HASH_TO_POINT_KECCAKPRNG.
+type falconHashToPointKeccakPRNG struct{}
+
+func (c *falconHashToPointKeccakPRNG) RequiredGas(input []byte) uint64 {
+	return params.FalconHashToPointGas
+}
+
+func (c *falconHashToPointKeccakPRNG) Run(input []byte) ([]byte, error) {
+	if len(input) != falconHashToPointInputSize {
+		return nil, errFalconInvalidInputLength
+	}
+	msg   := input[:falconMsgSize]
+	nonce := input[falconMsgSize+falconSigHdrSize : falconMsgSize+falconSigHdrSize+falconNonceSize]
+	poly  := falconHashToPoint(nonce, msg, true)
+	out   := make([]byte, falconChallengeSize)
+	for i, v := range poly {
+		out[2*i]   = byte(uint16(v))
+		out[2*i+1] = byte(uint16(v) >> 8)
+	}
+	return out, nil
+}
+
+func (c *falconHashToPointKeccakPRNG) Name() string { return "FALCON_HASH_TO_POINT_KECCAKPRNG" }
+
+// falconCore is a stub precompile for EIP-8052 FALCON_CORE.
+type falconCore struct{}
+
+func (c *falconCore) RequiredGas(input []byte) uint64 { return params.FalconCoreGas }
+
+func (c *falconCore) Run(input []byte) ([]byte, error) {
+	if len(input) != falconCoreInputSize {
+		return nil, errFalconInvalidInputLength
+	}
+	sig          := input[:falconSigSize]
+	pkRaw        := input[falconSigSize : falconSigSize+falconPKSize]
+	challengeRaw := input[falconSigSize+falconPKSize:]
+
 	if sig[0] != falconSigHeader {
 		return false32Byte, nil
 	}
-	nonce  := sig[falconSigHdrSize : falconSigHdrSize+falconNonceSize]
-	sigRaw := sig[falconSigHdrSize+falconNonceSize:]
+	sigBody := sig[falconSigHdrSize+falconNonceSize:]
 
-	// 1. Decode public key h ∈ Z_q[x]/(x^n+1).
 	h, ok := falconDecodePK(pkRaw)
 	if !ok {
 		return false32Byte, nil
 	}
-
-	// 2. Decompress signature polynomial s2.
-	s2, ok := falconDecompressSig(sigRaw)
+	s2, ok := falconDecompressSig(sigBody)
 	if !ok {
 		return false32Byte, nil
 	}
-
-	// 3. HashToPoint: c = SHAKE256(nonce ‖ msg) mod (q, x^n+1).
-	c := falconHashToPoint(nonce, msg, useKeccak)
-
-	// 4. Recover s1 = c − h·s2  (mod q, x^n+1).
+	var c [falconN]int32
+	for i := range c {
+		lo := uint16(challengeRaw[2*i])
+		hi := uint16(challengeRaw[2*i+1])
+		v  := int32(lo | hi<<8)
+		if v < 0 || v >= falconQ {
+			return false32Byte, nil
+		}
+		c[i] = v
+	}
 	hs2 := falconPolyMul(h, s2)
 	s1  := falconPolySub(c, hs2)
-
-	// 5. Verify norm bound: ‖s1‖² + ‖s2‖² ≤ β².
 	if !falconNormCheck(s1, s2) {
 		return false32Byte, nil
 	}
 	return true32Byte, nil
 }
+
+func (c *falconCore) Name() string { return "FALCON_CORE" }
 
 // ---------------------------------------------------------------------------
 // Public key decoding

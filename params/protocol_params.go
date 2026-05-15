@@ -168,8 +168,9 @@ const (
 
 	P256VerifyGas uint64 = 6900 // secp256r1 elliptic curve signature verifier gas price
 
-	VerifyMLDSAGas  uint64 = 4500 // ML-DSA-44 lattice-based signature verification gas price
-	VerifyFalconGas uint64 = 3000 // Falcon-512 lattice-based signature verification gas price
+	VerifyMLDSAGas       uint64 = 4500 // ML-DSA-44 lattice-based signature verification gas price
+	FalconHashToPointGas uint64 = 1000 // Falcon hash-to-point precompile gas price (stub)
+	FalconCoreGas        uint64 = 2000 // Falcon core verification precompile gas price (stub)
 
 	// The Refund Quotient is the cap on how much of the used gas can be refunded. Before EIP-3529,
 	// up to half the consumed gas could be refunded. Redefined as 1/5th in EIP-3529
