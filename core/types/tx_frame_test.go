@@ -324,8 +324,10 @@ func TestFrameDecodeRLPRejectsInvalidTargetLength(t *testing.T) {
 	for _, n := range tests {
 		payload, err := rlp.EncodeToBytes([]any{
 			uint8(FrameModeDefault),
+			uint8(0),
 			bytes.Repeat([]byte{0x11}, n),
 			uint64(1),
+			uint256.NewInt(0),
 			[]byte{0x01},
 		})
 		if err != nil {
@@ -348,8 +350,10 @@ func TestFrameDecodeRLPResetsNilTarget(t *testing.T) {
 
 	payload, err := rlp.EncodeToBytes([]any{
 		uint8(FrameModeVerify),
+		uint8(0),
 		[]byte{},
 		uint64(100),
+		uint256.NewInt(0),
 		[]byte("sig"),
 	})
 	if err != nil {
@@ -446,8 +450,10 @@ func TestFrameTxFloorDataGas(t *testing.T) {
 func TestFrameTxUnmarshalBinaryRejectsInvalidTargetLength(t *testing.T) {
 	type rawFrame struct {
 		Mode     uint8
+		Flags    uint8
 		Target   []byte
 		GasLimit uint64
+		Value    *uint256.Int
 		Data     []byte
 	}
 	type rawFrameTx struct {
@@ -468,8 +474,10 @@ func TestFrameTxUnmarshalBinaryRejectsInvalidTargetLength(t *testing.T) {
 		Frames: []rawFrame{
 			{
 				Mode:     FrameModeVerify,
+				Flags:    0,
 				Target:   bytes.Repeat([]byte{0x01}, common.AddressLength-1),
 				GasLimit: 100000,
+				Value:    uint256.NewInt(0),
 				Data:     []byte("signature"),
 			},
 		},
