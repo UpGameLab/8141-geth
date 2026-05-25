@@ -32,7 +32,7 @@ const (
 	falconMsgSize       = 32
 	falconSigSize       = 666
 	falconPKSize        = 896
-	falconChallengeSize = 896
+	falconChallengeSize = falconN * 2 // 512 coefficients × 2 bytes (16-bit LE)
 
 	falconHashToPointInputSize = falconMsgSize + falconSigSize
 	falconCoreInputSize        = falconSigSize + falconPKSize + falconChallengeSize
@@ -117,18 +117,18 @@ func (c *falconCore) Run(input []byte) ([]byte, error) {
 	if !ok {
 		return false32Byte, nil
 	}
-	var c [falconN]int32
-	for i := range c {
+	var challenge [falconN]int32
+	for i := range challenge {
 		lo := uint16(challengeRaw[2*i])
 		hi := uint16(challengeRaw[2*i+1])
 		v  := int32(lo | hi<<8)
 		if v < 0 || v >= falconQ {
 			return false32Byte, nil
 		}
-		c[i] = v
+		challenge[i] = v
 	}
 	hs2 := falconPolyMul(h, s2)
-	s1  := falconPolySub(c, hs2)
+	s1  := falconPolySub(challenge, hs2)
 	if !falconNormCheck(s1, s2) {
 		return false32Byte, nil
 	}
