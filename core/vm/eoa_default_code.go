@@ -38,9 +38,6 @@ const (
 )
 
 const (
-	falconAlgType    = 0xFA
-	falconEthAlgType = 0xFB
-
 	falconEOAInputSize = 2 + falconPKSize + falconSigSize
 )
 
@@ -269,10 +266,8 @@ func verifyFalconEOA(evm *EVM, target common.Address, input []byte, gas uint64, 
 	}
 	gas -= keccakGas
 
-	algType := byte(falconAlgType)
 	hashToPointAddr := common.BytesToAddress([]byte{0x14})
 	if useKeccak {
-		algType = falconEthAlgType
 		hashToPointAddr = common.BytesToAddress([]byte{0x15})
 	}
 	coreAddr := common.BytesToAddress([]byte{0x16})
@@ -285,11 +280,17 @@ func verifyFalconEOA(evm *EVM, target common.Address, input []byte, gas uint64, 
 	dataWithoutSig := input[:2]
 
 	// Verify target == keccak256(ALG_TYPE || pubkey)[12:].
-	addrInput := make([]byte, 1+len(pubKey))
-	addrInput[0] = algType
-	copy(addrInput[1:], pubKey)
-	addrHash := crypto.Keccak256(addrInput)
-	derivedAddr := common.BytesToAddress(addrHash[12:])
+	derivedAddr, err := crypto.FalconPubkeyToAddress(pubKey)
+	if err != nil {
+		return nil, gas, ErrExecutionReverted
+	}
+	if useKeccak {
+		addrInput := make([]byte, 1+len(pubKey))
+		addrInput[0] = crypto.Falcon512EthAlgType
+		copy(addrInput[1:], pubKey)
+		addrHash := crypto.Keccak256(addrInput)
+		derivedAddr = common.BytesToAddress(addrHash[12:])
+	}
 	if derivedAddr != target {
 		return nil, gas, ErrExecutionReverted
 	}

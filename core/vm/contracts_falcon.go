@@ -22,17 +22,17 @@ import (
 )
 
 const (
-  falconN           = 512
-  falconQ           = 12289
-  falconBetaSq      int64 = 34034726
-  falconNonceSize   = 40
-  falconSigBodySize = 625
-  falconSigHdrSize  = 1
-  falconSigHeader   = 0x39
-	falconMsgSize       = 32
-	falconSigSize       = 666
-	falconPKSize        = 896
-	falconChallengeSize = falconN * 2 // 512 coefficients × 2 bytes (16-bit LE)
+	falconN                   = 512
+	falconQ                   = 12289
+	falconBetaSq        int64 = 34034726
+	falconNonceSize           = 40
+	falconSigBodySize         = 625
+	falconSigHdrSize          = 1
+	falconSigHeader           = 0x39
+	falconMsgSize             = 32
+	falconSigSize             = 666
+	falconPKSize              = 896
+	falconChallengeSize       = falconN * 2 // 512 coefficients × 2 bytes (16-bit LE)
 
 	falconHashToPointInputSize = falconMsgSize + falconSigSize
 	falconCoreInputSize        = falconSigSize + falconPKSize + falconChallengeSize
@@ -49,20 +49,20 @@ func (c *falconHashToPointShake256) RequiredGas(input []byte) uint64 {
 }
 
 func (c *falconHashToPointShake256) Run(input []byte) ([]byte, error) {
-	if len(input) != falconHashToPointInputSize {
+	if len(input) < falconSigSize {
 		return nil, errFalconInvalidInputLength
 	}
-	msg   := input[:falconMsgSize]
-	nonce := input[falconMsgSize+falconSigHdrSize : falconMsgSize+falconSigHdrSize+falconNonceSize]
-	poly  := falconHashToPoint(nonce, msg, false)
-	out   := make([]byte, falconChallengeSize)
+	msg := input[:len(input)-falconSigSize]
+	sig := input[len(input)-falconSigSize:]
+	nonce := sig[falconSigHdrSize : falconSigHdrSize+falconNonceSize]
+	poly := falconHashToPoint(nonce, msg, false)
+	out := make([]byte, falconChallengeSize)
 	for i, v := range poly {
-		out[2*i]   = byte(uint16(v))
+		out[2*i] = byte(uint16(v))
 		out[2*i+1] = byte(uint16(v) >> 8)
 	}
 	return out, nil
 }
-
 
 func (c *falconHashToPointShake256) Name() string { return "FALCON_HASH_TO_POINT_SHAKE256" }
 
@@ -75,15 +75,16 @@ func (c *falconHashToPointKeccakPRNG) RequiredGas(input []byte) uint64 {
 }
 
 func (c *falconHashToPointKeccakPRNG) Run(input []byte) ([]byte, error) {
-	if len(input) != falconHashToPointInputSize {
+	if len(input) < falconSigSize {
 		return nil, errFalconInvalidInputLength
 	}
-	msg   := input[:falconMsgSize]
-	nonce := input[falconMsgSize+falconSigHdrSize : falconMsgSize+falconSigHdrSize+falconNonceSize]
-	poly  := falconHashToPoint(nonce, msg, true)
-	out   := make([]byte, falconChallengeSize)
+	msg := input[:len(input)-falconSigSize]
+	sig := input[len(input)-falconSigSize:]
+	nonce := sig[falconSigHdrSize : falconSigHdrSize+falconNonceSize]
+	poly := falconHashToPoint(nonce, msg, true)
+	out := make([]byte, falconChallengeSize)
 	for i, v := range poly {
-		out[2*i]   = byte(uint16(v))
+		out[2*i] = byte(uint16(v))
 		out[2*i+1] = byte(uint16(v) >> 8)
 	}
 	return out, nil
@@ -100,39 +101,61 @@ func (c *falconCore) Run(input []byte) ([]byte, error) {
 	if len(input) != falconCoreInputSize {
 		return nil, errFalconInvalidInputLength
 	}
-	sig          := input[:falconSigSize]
-	pkRaw        := input[falconSigSize : falconSigSize+falconPKSize]
-	challengeRaw := input[falconSigSize+falconPKSize:]
 
+	// Prefer the historical repo ABI, then fall back to the EIP-8052-style
+	// challenge || sig || pk layout. Header bytes alone are ambiguous because
+	// challenge coefficients may start with 0x39.
+	if input[0] == falconSigHeader {
+		if falconCoreVerify(
+			input[:falconSigSize],
+			input[falconSigSize:falconSigSize+falconPKSize],
+			input[falconSigSize+falconPKSize:],
+		) {
+			return true32Byte, nil
+		}
+	}
+	if input[falconChallengeSize] == falconSigHeader {
+		if falconCoreVerify(
+			input[falconChallengeSize:falconChallengeSize+falconSigSize],
+			input[falconChallengeSize+falconSigSize:],
+			input[:falconChallengeSize],
+		) {
+			return true32Byte, nil
+		}
+	}
+	return false32Byte, nil
+}
+
+func falconCoreVerify(sig, pkRaw, challengeRaw []byte) bool {
 	if sig[0] != falconSigHeader {
-		return false32Byte, nil
+		return false
 	}
 	sigBody := sig[falconSigHdrSize+falconNonceSize:]
 
 	h, ok := falconDecodePK(pkRaw)
 	if !ok {
-		return false32Byte, nil
+		return false
 	}
 	s2, ok := falconDecompressSig(sigBody)
 	if !ok {
-		return false32Byte, nil
+		return false
 	}
 	var challenge [falconN]int32
 	for i := range challenge {
 		lo := uint16(challengeRaw[2*i])
 		hi := uint16(challengeRaw[2*i+1])
-		v  := int32(lo | hi<<8)
+		v := int32(lo | hi<<8)
 		if v < 0 || v >= falconQ {
-			return false32Byte, nil
+			return false
 		}
 		challenge[i] = v
 	}
 	hs2 := falconPolyMul(h, s2)
-	s1  := falconPolySub(challenge, hs2)
+	s1 := falconPolySub(challenge, hs2)
 	if !falconNormCheck(s1, s2) {
-		return false32Byte, nil
+		return false
 	}
-	return true32Byte, nil
+	return true
 }
 
 func (c *falconCore) Name() string { return "FALCON_CORE" }
@@ -153,17 +176,19 @@ func falconDecodePK(data []byte) ([falconN]int32, bool) {
 			if off >= len(data) {
 				return h, false
 			}
-			acc |= uint32(data[off]) << accLen
+			acc = (acc << 8) | uint32(data[off])
 			accLen += 8
 			off++
 		}
-		v := int32(acc & 0x3FFF)
-		acc >>= 14
 		accLen -= 14
+		v := int32((acc >> accLen) & 0x3FFF)
 		if v >= falconQ {
 			return h, false
 		}
 		h[i] = v
+	}
+	if accLen > 0 && acc&((1<<accLen)-1) != 0 {
+		return h, false
 	}
 	return h, true
 }
@@ -172,7 +197,7 @@ func falconDecodePK(data []byte) ([falconN]int32, bool) {
 // Signature decompression
 // ---------------------------------------------------------------------------
 
-// falconBitReader reads bits LSB-first from a byte slice.
+// falconBitReader reads bits MSB-first from a byte slice.
 type falconBitReader struct {
 	data    []byte
 	byteOff int
@@ -184,7 +209,7 @@ func (r *falconBitReader) refill() bool {
 	if r.byteOff >= len(r.data) {
 		return false
 	}
-	r.acc |= uint32(r.data[r.byteOff]) << r.accLen
+	r.acc = (r.acc << 8) | uint32(r.data[r.byteOff])
 	r.byteOff++
 	r.accLen += 8
 	return true
@@ -194,42 +219,37 @@ func (r *falconBitReader) read1() (uint32, bool) {
 	if r.accLen == 0 && !r.refill() {
 		return 0, false
 	}
-	bit := r.acc & 1
-	r.acc >>= 1
 	r.accLen--
+	bit := (r.acc >> r.accLen) & 1
 	return bit, true
 }
 
-func (r *falconBitReader) read7() (uint32, bool) {
-	for r.accLen < 7 {
+func (r *falconBitReader) read8() (uint32, bool) {
+	for r.accLen < 8 {
 		if !r.refill() {
 			return 0, false
 		}
 	}
-	bits := r.acc & 0x7F
-	r.acc >>= 7
-	r.accLen -= 7
+	r.accLen -= 8
+	bits := (r.acc >> r.accLen) & 0xFF
 	return bits, true
 }
 
 // falconDecompressSig decodes falconN signed integer coefficients from the
 // 625-byte padded compressed signature. Encoding per Falcon spec §3.11.2:
-// sign(1) | low7(7) | unary(high) where coeff = sign × ((high<<7)|low7).
+// sign(1) | low7(7) | unary(high) where coeff = sign × (low7 + 128*high).
 func falconDecompressSig(data []byte) ([falconN]int32, bool) {
 	var s2 [falconN]int32
 	br := &falconBitReader{data: data}
 
 	for i := 0; i < falconN; i++ {
-		s, ok := br.read1()
+		b, ok := br.read8()
 		if !ok {
 			return s2, false
 		}
-		low7, ok := br.read7()
-		if !ok {
-			return s2, false
-		}
+		s := b & 0x80
+		coeff := int32(b & 0x7F)
 		// Read unary-encoded high part: count leading zeros until stop bit 1.
-		high := 0
 		for {
 			b, ok := br.read1()
 			if !ok {
@@ -238,14 +258,12 @@ func falconDecompressSig(data []byte) ([falconN]int32, bool) {
 			if b == 1 {
 				break
 			}
-			high++
-			// Bound prevents runaway on malformed input; max valid high ≈ 45.
-			if high > 63 {
+			coeff += 128
+			if coeff > 2047 {
 				return s2, false
 			}
 		}
-		coeff := int32((high << 7) | int(low7))
-		if s == 1 {
+		if s != 0 {
 			if coeff == 0 {
 				// Negative zero is invalid per spec.
 				return s2, false
@@ -292,7 +310,7 @@ func falconHashToPoint(nonce, msg []byte, useKeccak bool) [falconN]int32 {
 	var buf [2]byte
 	for i := 0; i < falconN; {
 		xof.Read(buf[:])
-		v := uint32(buf[0]) | uint32(buf[1])<<8 // little-endian 16-bit
+		v := uint32(buf[0])<<8 | uint32(buf[1]) // big-endian 16-bit
 		if v < limit {
 			c[i] = int32(v % falconQ)
 			i++

@@ -146,6 +146,49 @@ func TestNewContractAddress(t *testing.T) {
 	checkAddr(t, common.HexToAddress("c9ddedf451bc62ce88bf9292afb13df35b670699"), caddr2)
 }
 
+func TestFalconPubkeyToAddress(t *testing.T) {
+	pk := make([]byte, Falcon512PublicKeyBytes)
+	for i := range pk {
+		pk[i] = byte(i)
+	}
+	addr, err := FalconPubkeyToAddress(pk)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	checkAddr(t, common.HexToAddress("0xace180415555a49d3e6080522c15b6e318da6e6a"), addr)
+}
+
+func TestFalconPubkeyToAddressRejectsWrongLength(t *testing.T) {
+	tests := [][]byte{
+		nil,
+		make([]byte, Falcon512PublicKeyBytes-1),
+		make([]byte, Falcon512PublicKeyBytes+1),
+	}
+	for _, pk := range tests {
+		if _, err := FalconPubkeyToAddress(pk); err == nil {
+			t.Fatalf("expected error for public key length %d", len(pk))
+		}
+	}
+}
+
+func TestFalconPubkeyToAddressDistinctKeys(t *testing.T) {
+	pk1 := make([]byte, Falcon512PublicKeyBytes)
+	pk2 := make([]byte, Falcon512PublicKeyBytes)
+	pk2[Falcon512PublicKeyBytes-1] = 1
+
+	addr1, err := FalconPubkeyToAddress(pk1)
+	if err != nil {
+		t.Fatalf("unexpected error for pk1: %v", err)
+	}
+	addr2, err := FalconPubkeyToAddress(pk2)
+	if err != nil {
+		t.Fatalf("unexpected error for pk2: %v", err)
+	}
+	if addr1 == addr2 {
+		t.Fatalf("different Falcon public keys produced same address %x", addr1)
+	}
+}
+
 func TestLoadECDSA(t *testing.T) {
 	tests := []struct {
 		input string

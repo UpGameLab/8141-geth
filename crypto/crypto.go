@@ -43,6 +43,19 @@ const RecoveryIDOffset = 64
 // DigestLength sets the signature digest exact length
 const DigestLength = 32
 
+const (
+	// Falcon512PublicKeyBytes is the encoded Falcon-512 public key size.
+	Falcon512PublicKeyBytes = 896
+
+	// Falcon512AlgType is the algorithm identifier used for Falcon-512 EOA
+	// address derivation: keccak256(ALG_TYPE || pubkey)[12:].
+	Falcon512AlgType byte = 0xFA
+
+	// Falcon512EthAlgType is the algorithm identifier reserved for the
+	// Keccak-PRNG Falcon-512 variant used by the EOA default code.
+	Falcon512EthAlgType byte = 0xFB
+)
+
 var (
 	secp256k1N     = S256().Params().N
 	secp256k1halfN = new(big.Int).Div(secp256k1N, big.NewInt(2))
@@ -253,6 +266,13 @@ func ValidateSignatureValues(v byte, r, s *big.Int, homestead bool) bool {
 func PubkeyToAddress(p ecdsa.PublicKey) common.Address {
 	pubBytes := FromECDSAPub(&p)
 	return common.BytesToAddress(Keccak256(pubBytes[1:])[12:])
+}
+
+func FalconPubkeyToAddress(pk []byte) (common.Address, error) {
+	if len(pk) != Falcon512PublicKeyBytes {
+		return common.Address{}, fmt.Errorf("invalid Falcon-512 public key length: got %d, want %d", len(pk), Falcon512PublicKeyBytes)
+	}
+	return common.BytesToAddress(Keccak256([]byte{Falcon512AlgType}, pk)[12:]), nil
 }
 
 func zeroBytes(bytes []byte) {

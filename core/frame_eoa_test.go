@@ -24,6 +24,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/tracing"
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/rlp"
@@ -103,6 +104,22 @@ func testFalconEOAMaterial() ([]byte, []byte) {
 		sig[i] = byte(255 - i)
 	}
 	return pubKey, sig
+}
+
+type falconEOATestCore struct{}
+
+func (falconEOATestCore) RequiredGas([]byte) uint64 { return params.FalconCoreGas }
+func (falconEOATestCore) Run([]byte) ([]byte, error) {
+	return common.LeftPadBytes([]byte{1}, 32), nil
+}
+func (falconEOATestCore) Name() string { return "FALCON_CORE_TEST" }
+
+// installFalconEOATestCore keeps these core tests focused on EOA default-code
+// approval behavior. The VM KAT tests cover the real Falcon verifier.
+func installFalconEOATestCore(evm *vm.EVM, config *params.ChainConfig) {
+	precompiles := vm.ActivePrecompiledContracts(config.Rules(big.NewInt(1), true, 0))
+	precompiles[common.BytesToAddress([]byte{0x16})] = falconEOATestCore{}
+	evm.SetPrecompiles(precompiles)
 }
 
 // buildEOASenderData builds the frame.data for EOA default code SENDER mode.
@@ -248,9 +265,10 @@ func TestEOADefaultCodeVerifyOnly(t *testing.T) {
 
 func TestEOADefaultCodeFalcon(t *testing.T) {
 	evm, statedb, config := newFrameTestEnv()
+	installFalconEOATestCore(evm, config)
 
 	pubKey, sig := testFalconEOAMaterial()
-	sender := deriveFalconEOAAddress(0xFA, pubKey)
+	sender := deriveFalconEOAAddress(crypto.Falcon512AlgType, pubKey)
 
 	statedb.CreateAccount(sender)
 	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
@@ -282,9 +300,10 @@ func TestEOADefaultCodeFalcon(t *testing.T) {
 
 func TestEOADefaultCodeFalconEth(t *testing.T) {
 	evm, statedb, config := newFrameTestEnv()
+	installFalconEOATestCore(evm, config)
 
 	pubKey, sig := testFalconEOAMaterial()
-	sender := deriveFalconEOAAddress(0xFB, pubKey)
+	sender := deriveFalconEOAAddress(crypto.Falcon512EthAlgType, pubKey)
 
 	statedb.CreateAccount(sender)
 	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
@@ -347,7 +366,7 @@ func TestEOADefaultCodeFalconInvalidDataLength(t *testing.T) {
 	evm, statedb, config := newFrameTestEnv()
 
 	pubKey, _ := testFalconEOAMaterial()
-	sender := deriveFalconEOAAddress(0xFA, pubKey)
+	sender := deriveFalconEOAAddress(crypto.Falcon512AlgType, pubKey)
 
 	statedb.CreateAccount(sender)
 	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)

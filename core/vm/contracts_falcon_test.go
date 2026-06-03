@@ -186,21 +186,33 @@ func TestFalconPrecompileExportedSet(t *testing.T) {
 
 func TestFalconInvalidInputLength(t *testing.T) {
 	tests := []struct {
-		name  string
-		p     PrecompiledContract
-		valid int
+		name    string
+		p       PrecompiledContract
+		invalid []int
 	}{
-		{"hash-to-point-shake256", &falconHashToPointShake256{}, falconHashToPointInputSize},
-		{"hash-to-point-keccakprng", &falconHashToPointKeccakPRNG{}, falconHashToPointInputSize},
-		{"core", &falconCore{}, falconCoreInputSize},
+		{"hash-to-point-shake256", &falconHashToPointShake256{}, []int{0, 1, falconSigSize - 1}},
+		{"hash-to-point-keccakprng", &falconHashToPointKeccakPRNG{}, []int{0, 1, falconSigSize - 1}},
+		{"core", &falconCore{}, []int{0, 1, falconCoreInputSize - 1, falconCoreInputSize + 1}},
 	}
 	for _, tt := range tests {
-		for _, l := range []int{0, 1, tt.valid - 1, tt.valid + 1} {
+		for _, l := range tt.invalid {
 			ret, err := tt.p.Run(make([]byte, l))
 			if ret != nil || err == nil {
 				t.Errorf("%s len=%d: want (nil,err), got (%v,%v)", tt.name, l, ret, err)
 			}
 		}
+	}
+}
+
+func TestFalconHashToPointAcceptsVariableMessageLength(t *testing.T) {
+	input := make([]byte, falconHashToPointInputSize+17)
+	input[len(input)-falconSigSize] = falconSigHeader
+	ret, err := (&falconHashToPointShake256{}).Run(input)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(ret) != falconChallengeSize {
+		t.Fatalf("unexpected challenge size: got %d want %d", len(ret), falconChallengeSize)
 	}
 }
 
@@ -228,12 +240,11 @@ func TestFalconDecodePKMaxValid(t *testing.T) {
 	accLen := uint(0)
 	off := 0
 	for i := 0; i < falconN; i++ {
-		acc |= uint64(falconQ-1) << accLen
+		acc = (acc << 14) | uint64(falconQ-1)
 		accLen += 14
 		for accLen >= 8 {
-			data[off] = byte(acc)
-			acc >>= 8
 			accLen -= 8
+			data[off] = byte(acc >> accLen)
 			off++
 		}
 	}
@@ -251,12 +262,19 @@ func TestFalconDecodePKMaxValid(t *testing.T) {
 func TestFalconDecodePKRejectsQOrAbove(t *testing.T) {
 	// Encode q = 12289 = 0x3001 in the first 14-bit slot.
 	data := make([]byte, falconPKSize)
-	// First coefficient = q in 14 bits: 0x3001, stored LE.
-	data[0] = 0x01 // bits 0-7: 0x01
-	data[1] = 0x30 // bits 8-13 = 0x30, upper 2 bits of byte 1 = 0
+	// First coefficient = q in 14 bits: 0x3001, stored MSB-first.
+	data[0] = 0xC0
+	data[1] = 0x04
 	_, ok := falconDecodePK(data)
 	if ok {
 		t.Fatal("PK with coefficient >= q should be rejected")
+	}
+}
+
+func TestFalconDecodePKRejectsTruncatedInput(t *testing.T) {
+	data := make([]byte, falconPKSize-1)
+	if _, ok := falconDecodePK(data); ok {
+		t.Fatal("truncated PK should be rejected")
 	}
 }
 
@@ -269,59 +287,57 @@ func TestFalconDecodePKRejectsQOrAbove(t *testing.T) {
 // The result is zero-padded to falconSigBodySize bytes.
 func buildCompressedSig(coeffs [falconN]int32) []byte {
 	buf := make([]byte, falconSigBodySize)
-	acc := uint64(0)
-	accLen := uint(0)
-	putBit := func(b uint64) {
-		acc |= b << accLen
-		accLen++
-		if accLen == 8 {
-			buf[0] = byte(acc) // placeholder; we use a separate index below
+	off := 0
+	var cur byte
+	var used uint
+
+	emitBit := func(b byte) {
+		cur = (cur << 1) | (b & 1)
+		used++
+		if used == 8 {
+			buf[off] = cur
+			off++
+			cur = 0
+			used = 0
 		}
 	}
-	_ = putBit
-
-	// Use a proper bit writer.
-	var bits []byte
-	var cur byte
-	var pos uint
-
-	emit := func(b uint, nbits uint) {
-		for nbits > 0 {
-			cur |= byte(b&1) << pos
-			b >>= 1
-			pos++
-			nbits--
-			if pos == 8 {
-				bits = append(bits, cur)
-				cur = 0
-				pos = 0
-			}
+	emitByte := func(b byte) {
+		for i := 7; i >= 0; i-- {
+			emitBit((b >> i) & 1)
 		}
 	}
 
 	for _, v := range coeffs {
 		abs := v
-		s := uint(0)
+		sign := byte(0)
 		if v < 0 {
 			abs = -v
-			s = 1
+			sign = 0x80
 		}
-		low7 := uint(abs) & 0x7F
+		low7 := byte(abs) & 0x7F
 		high := uint(abs) >> 7
 
-		emit(s, 1)      // sign
-		emit(low7, 7)   // low 7 bits
+		emitByte(sign | low7)
 		for k := uint(0); k < high; k++ {
-			emit(0, 1) // unary zeros
+			emitBit(0)
 		}
-		emit(1, 1) // stop bit
+		emitBit(1)
 	}
-	if pos > 0 {
-		bits = append(bits, cur)
+	if used > 0 {
+		buf[off] = cur << (8 - used)
 	}
-
-	copy(buf, bits)
 	return buf
+}
+
+func TestFalconBitReaderEOF(t *testing.T) {
+	br := &falconBitReader{}
+	if _, ok := br.read1(); ok {
+		t.Fatal("read1 on empty input should fail")
+	}
+	br = &falconBitReader{}
+	if _, ok := br.read8(); ok {
+		t.Fatal("read8 on empty input should fail")
+	}
 }
 
 func TestFalconDecompressSigAllZero(t *testing.T) {
@@ -368,18 +384,68 @@ func TestFalconDecompressSigRoundTrip(t *testing.T) {
 	}
 }
 
+func TestFalconDecompressSigBoundaryCoefficients(t *testing.T) {
+	var coeffs [falconN]int32
+	coeffs[0] = 2047
+	coeffs[1] = -2047
+
+	sig := buildCompressedSig(coeffs)
+	got, ok := falconDecompressSig(sig)
+	if !ok {
+		t.Fatal("boundary coefficients should decompress OK")
+	}
+	for i := 0; i < 2; i++ {
+		if got[i] != coeffs[i] {
+			t.Fatalf("coeff[%d]: got %d, want %d", i, got[i], coeffs[i])
+		}
+	}
+}
+
+func TestFalconDecompressSigRejectsTruncatedBeforeFirstCoeff(t *testing.T) {
+	if _, ok := falconDecompressSig(nil); ok {
+		t.Fatal("empty signature body should be rejected")
+	}
+}
+
+func TestFalconDecompressSigRejectsMissingStopBit(t *testing.T) {
+	if _, ok := falconDecompressSig([]byte{0x00}); ok {
+		t.Fatal("coefficient without unary stop bit should be rejected")
+	}
+}
+
+func TestFalconDecompressSigRejectsCoefficientAboveLimit(t *testing.T) {
+	var coeffs [falconN]int32
+	coeffs[0] = 2048
+	sig := buildCompressedSig(coeffs)
+	if _, ok := falconDecompressSig(sig); ok {
+		t.Fatal("coefficient above decoder limit should be rejected")
+	}
+}
+
 func TestFalconDecompressSigRejectsNegativeZero(t *testing.T) {
 	// Construct a signature where the first coefficient is "negative zero":
 	// sign=1, low7=0, high=0 → encoded as 1(sign) 0000000(low7) 1(stop).
 	buf := make([]byte, falconSigBodySize)
-	// First byte: bit0=sign=1, bits1-7=low7=0, bit8=stop=1
-	// bit 0 = sign = 1, bits 1-7 = low7 = 0 → byte0 = 0b00000001 = 0x01
-	// bit 8 = stop = 1 → byte1, bit 0 = 1 → byte1 = 0x01
-	buf[0] = 0x01
-	buf[1] = 0x01
+	// bit 7 = sign = 1, bits 6-0 = low7 = 0 → byte0 = 0x80
+	// bit 8 = stop = 1 → byte1, bit 7 = 1 → byte1 = 0x80
+	buf[0] = 0x80
+	buf[1] = 0x80
 	_, ok := falconDecompressSig(buf)
 	if ok {
 		t.Fatal("negative zero should be rejected")
+	}
+}
+
+func TestFalconDecompressSigRejectsNonZeroBitPadding(t *testing.T) {
+	var coeffs [falconN]int32
+	coeffs[0] = 128
+	sig := buildCompressedSig(coeffs)
+
+	const bitLen = falconN*9 + 1 // one extra unary high bit for coeffs[0]=128
+	sig[bitLen/8] |= 0x01
+
+	if _, ok := falconDecompressSig(sig); ok {
+		t.Fatal("non-zero padding bits in final buffered byte should be rejected")
 	}
 }
 
@@ -567,6 +633,26 @@ func TestFalconNormCheckAtBound(t *testing.T) {
 	}
 	if !falconNormCheck(s1, s2) {
 		t.Fatal("norm at/below β² should pass")
+	}
+}
+
+func TestFalconNormCheckExactBetaBoundary(t *testing.T) {
+	var s1, s2 [falconN]int32
+	s2[0] = 89
+	s2[1] = 54
+	s2[2] = 5833
+	if !falconNormCheck(s1, s2) {
+		t.Fatal("norm exactly at beta squared should pass")
+	}
+}
+
+func TestFalconNormCheckJustAboveBetaBoundary(t *testing.T) {
+	var s1, s2 [falconN]int32
+	s2[0] = 90
+	s2[1] = 54
+	s2[2] = 5833
+	if falconNormCheck(s1, s2) {
+		t.Fatal("norm just above beta squared should fail")
 	}
 }
 
