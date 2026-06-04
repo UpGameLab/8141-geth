@@ -120,10 +120,91 @@ const (
 	txParamFrameStatus  = 0x15
 )
 
+// FRAMEPARAM compatibility selectors emitted by the Solidity frameparam builtin.
+const (
+	frameParamTarget       = 0x00
+	frameParamGas          = 0x01
+	frameParamMode         = 0x02
+	frameParamFlags        = 0x03
+	frameParamDataLen      = 0x04
+	frameParamStatus       = 0x05
+	frameParamAllowedScope = 0x06
+	frameParamAtomicBatch  = 0x07
+	frameParamValue        = 0x08
+
+	frameParamApproveScopeMask = 0x03
+	frameParamAtomicBatchFlag  = 0x04
+)
+
 // bytes32 converts a uint256 to a []byte slice via its Bytes32() method.
 func bytes32(v *uint256.Int) []byte {
 	b := v.Bytes32()
 	return b[:]
+}
+
+// getFrameParam returns a fixed-width frame parameter selected by the
+// compatibility selector namespace used by Solidity's frameparam builtin.
+func getFrameParam(evm *EVM, in1, in2 uint64, opcode OpCode) ([]byte, error) {
+	fc := evm.FrameCtx
+	if fc == nil {
+		return nil, ErrWriteProtection // Not in a frame tx context.
+	}
+	if in2 >= uint64(len(fc.Frames)) {
+		return nil, &ErrInvalidOpCode{opcode: opcode}
+	}
+	idx := int(in2)
+	f := &fc.Frames[idx]
+
+	switch in1 {
+	case frameParamTarget:
+		var buf [32]byte
+		if f.Target != nil {
+			copy(buf[12:], f.Target[:])
+		} else {
+			copy(buf[12:], fc.Sender[:])
+		}
+		return buf[:], nil
+
+	case frameParamGas:
+		return bytes32(new(uint256.Int).SetUint64(f.GasLimit)), nil
+
+	case frameParamMode:
+		return bytes32(new(uint256.Int).SetUint64(uint64(f.Mode))), nil
+
+	case frameParamFlags:
+		return bytes32(new(uint256.Int).SetUint64(uint64(f.Flags))), nil
+
+	case frameParamDataLen:
+		return bytes32(new(uint256.Int).SetUint64(uint64(len(f.Data)))), nil
+
+	case frameParamStatus:
+		// Cannot query current or future frame status.
+		if idx >= fc.FrameIndex {
+			return nil, &ErrInvalidOpCode{opcode: opcode}
+		}
+		return bytes32(new(uint256.Int).SetUint64(uint64(fc.FrameResults[idx]))), nil
+
+	case frameParamAllowedScope:
+		scope := f.Flags & frameParamApproveScopeMask
+		return bytes32(new(uint256.Int).SetUint64(uint64(scope))), nil
+
+	case frameParamAtomicBatch:
+		var atomic uint64
+		if f.Flags&frameParamAtomicBatchFlag != 0 {
+			atomic = 1
+		}
+		return bytes32(new(uint256.Int).SetUint64(atomic)), nil
+
+	case frameParamValue:
+		value := new(uint256.Int)
+		if f.Value != nil {
+			value.Set(f.Value)
+		}
+		return bytes32(value), nil
+
+	default:
+		return nil, &ErrInvalidOpCode{opcode: opcode}
+	}
 }
 
 // getTxParam returns the byte slice for the given tx parameter.
@@ -133,6 +214,12 @@ func getTxParam(evm *EVM, in1, in2 uint64) ([]byte, error) {
 	fc := evm.FrameCtx
 	if fc == nil {
 		return nil, ErrWriteProtection // Not in a frame tx context.
+	}
+
+	// A nonzero frame index disambiguates Solidity frameparam compatibility
+	// selectors from the overlapping transaction parameter selectors 0x00-0x08.
+	if in1 <= frameParamValue && in2 != 0 {
+		return getFrameParam(evm, in1, in2, TXPARAMLOAD)
 	}
 
 	// Per EIP-8141, in2 must be 0 for non-frame-indexed parameters (0x00-0x10).
@@ -205,18 +292,7 @@ func getTxParam(evm *EVM, in1, in2 uint64) ([]byte, error) {
 		return bytes32(v), nil
 
 	case txParamFrameTarget:
-		if in2 >= uint64(len(fc.Frames)) {
-			return nil, &ErrInvalidOpCode{opcode: TXPARAMLOAD}
-		}
-		idx := int(in2)
-		var buf [32]byte
-		f := &fc.Frames[idx]
-		if f.Target != nil {
-			copy(buf[12:], f.Target[:])
-		} else {
-			copy(buf[12:], fc.Sender[:])
-		}
-		return buf[:], nil
+		return getFrameParam(evm, frameParamTarget, in2, TXPARAMLOAD)
 
 	case txParamFrameData:
 		if in2 >= uint64(len(fc.Frames)) {
@@ -231,34 +307,31 @@ func getTxParam(evm *EVM, in1, in2 uint64) ([]byte, error) {
 		return f.Data, nil
 
 	case txParamFrameGas:
-		if in2 >= uint64(len(fc.Frames)) {
-			return nil, &ErrInvalidOpCode{opcode: TXPARAMLOAD}
-		}
-		v := new(uint256.Int).SetUint64(fc.Frames[int(in2)].GasLimit)
-		return bytes32(v), nil
+		return getFrameParam(evm, frameParamGas, in2, TXPARAMLOAD)
 
 	case txParamFrameMode:
-		if in2 >= uint64(len(fc.Frames)) {
-			return nil, &ErrInvalidOpCode{opcode: TXPARAMLOAD}
-		}
-		v := new(uint256.Int).SetUint64(uint64(fc.Frames[int(in2)].Mode))
-		return bytes32(v), nil
+		return getFrameParam(evm, frameParamMode, in2, TXPARAMLOAD)
 
 	case txParamFrameStatus:
-		if in2 >= uint64(len(fc.Frames)) {
-			return nil, &ErrInvalidOpCode{opcode: TXPARAMLOAD}
-		}
-		idx := int(in2)
-		// Cannot query current or future frame status.
-		if idx >= fc.FrameIndex {
-			return nil, &ErrInvalidOpCode{opcode: TXPARAMLOAD}
-		}
-		v := new(uint256.Int).SetUint64(uint64(fc.FrameResults[idx]))
-		return bytes32(v), nil
+		return getFrameParam(evm, frameParamStatus, in2, TXPARAMLOAD)
 
 	default:
 		return nil, &ErrInvalidOpCode{opcode: TXPARAMLOAD}
 	}
+}
+
+// opFrameParam implements the FRAMEPARAM compatibility opcode (0xb3).
+// Stack: [in1, frameIndex] → [value]
+func opFrameParam(pc *uint64, evm *EVM, scope *ScopeContext) ([]byte, error) {
+	in1 := scope.Stack.pop()
+	frameIndex := scope.Stack.peek()
+
+	data, err := getFrameParam(evm, in1.Uint64(), frameIndex.Uint64(), FRAMEPARAM)
+	if err != nil {
+		return nil, err
+	}
+	frameIndex.SetBytes(data)
+	return nil, nil
 }
 
 // opTxParamLoad implements TXPARAMLOAD (0xb0).

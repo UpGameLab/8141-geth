@@ -222,6 +222,7 @@ const (
 	TXPARAMLOAD OpCode = 0xb0
 	TXPARAMSIZE OpCode = 0xb1
 	TXPARAMCOPY OpCode = 0xb2
+	FRAMEPARAM  OpCode = 0xb3
 )
 
 // 0xd0 range - eof operations.
@@ -435,6 +436,7 @@ var opCodeToString = [256]string{
 	TXPARAMLOAD: "TXPARAMLOAD",
 	TXPARAMSIZE: "TXPARAMSIZE",
 	TXPARAMCOPY: "TXPARAMCOPY",
+	FRAMEPARAM:  "FRAMEPARAM",
 
 	// 0xd range - eof ops.
 	DATALOAD:  "DATALOAD",
@@ -628,6 +630,7 @@ var stringToOp = map[string]OpCode{
 	"TXPARAMLOAD":     TXPARAMLOAD,
 	"TXPARAMSIZE":     TXPARAMSIZE,
 	"TXPARAMCOPY":     TXPARAMCOPY,
+	"FRAMEPARAM":      FRAMEPARAM,
 	"DATALOAD":        DATALOAD,
 	"DATALOADN":       DATALOADN,
 	"DATASIZE":        DATASIZE,

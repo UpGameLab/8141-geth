@@ -587,4 +587,10 @@ func enable8141(jt *JumpTable) {
 		maxStack:    maxStack(5, 0),
 		memorySize:  memoryTxParamCopy,
 	}
+	jt[FRAMEPARAM] = &operation{
+		execute:     opFrameParam,
+		constantGas: GasFastStep,
+		minStack:    minStack(2, 1),
+		maxStack:    maxStack(2, 1),
+	}
 }
