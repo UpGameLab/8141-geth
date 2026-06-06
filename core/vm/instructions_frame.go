@@ -112,6 +112,7 @@ const (
 	txParamBlobHashLen  = 0x07
 	txParamSigHash      = 0x08
 	txParamFrameCount   = 0x09
+	txParamCurrentFrame = 0x0A
 	txParamFrameIdx     = 0x10
 	txParamFrameTarget  = 0x11
 	txParamFrameData    = 0x12
@@ -287,7 +288,7 @@ func getTxParam(evm *EVM, in1, in2 uint64) ([]byte, error) {
 		v := new(uint256.Int).SetUint64(uint64(len(fc.Frames)))
 		return bytes32(v), nil
 
-	case txParamFrameIdx:
+	case txParamCurrentFrame, txParamFrameIdx:
 		v := new(uint256.Int).SetUint64(uint64(fc.FrameIndex))
 		return bytes32(v), nil
 
@@ -335,27 +336,15 @@ func opFrameParam(pc *uint64, evm *EVM, scope *ScopeContext) ([]byte, error) {
 }
 
 // opTxParamLoad implements TXPARAMLOAD (0xb0).
-// Stack: [in1, in2, offset] → [value]
+// Stack: [in1] → [value]
 func opTxParamLoad(pc *uint64, evm *EVM, scope *ScopeContext) ([]byte, error) {
-	in1 := scope.Stack.pop()
-	in2 := scope.Stack.pop()
-	offset := scope.Stack.peek()
+	in1 := scope.Stack.peek()
 
-	data, err := getTxParam(evm, in1.Uint64(), in2.Uint64())
+	data, err := getTxParam(evm, in1.Uint64(), 0)
 	if err != nil {
 		return nil, err
 	}
-
-	off := int(offset.Uint64())
-	var word [32]byte
-	if off < len(data) {
-		end := off + 32
-		if end > len(data) {
-			end = len(data)
-		}
-		copy(word[:], data[off:end])
-	}
-	offset.SetBytes32(word[:])
+	in1.SetBytes(data)
 	return nil, nil
 }
 

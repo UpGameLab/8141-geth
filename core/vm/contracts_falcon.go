@@ -18,6 +18,7 @@ package vm
 
 import (
 	"errors"
+
 	"github.com/ethereum/go-ethereum/params"
 )
 
@@ -32,7 +33,7 @@ const (
 	falconMsgSize             = 32
 	falconSigSize             = 666
 	falconPKSize              = 896
-	falconChallengeSize       = falconN * 2 // 512 coefficients × 2 bytes (16-bit LE)
+	falconChallengeSize       = falconPKSize // 512 coefficients × 14 bits
 
 	falconHashToPointInputSize = falconMsgSize + falconSigSize
 	falconCoreInputSize        = falconSigSize + falconPKSize + falconChallengeSize
@@ -56,12 +57,7 @@ func (c *falconHashToPointShake256) Run(input []byte) ([]byte, error) {
 	sig := input[len(input)-falconSigSize:]
 	nonce := sig[falconSigHdrSize : falconSigHdrSize+falconNonceSize]
 	poly := falconHashToPoint(nonce, msg, false)
-	out := make([]byte, falconChallengeSize)
-	for i, v := range poly {
-		out[2*i] = byte(uint16(v))
-		out[2*i+1] = byte(uint16(v) >> 8)
-	}
-	return out, nil
+	return falconEncodePolynomial(poly), nil
 }
 
 func (c *falconHashToPointShake256) Name() string { return "FALCON_HASH_TO_POINT_SHAKE256" }
@@ -82,12 +78,7 @@ func (c *falconHashToPointKeccakPRNG) Run(input []byte) ([]byte, error) {
 	sig := input[len(input)-falconSigSize:]
 	nonce := sig[falconSigHdrSize : falconSigHdrSize+falconNonceSize]
 	poly := falconHashToPoint(nonce, msg, true)
-	out := make([]byte, falconChallengeSize)
-	for i, v := range poly {
-		out[2*i] = byte(uint16(v))
-		out[2*i+1] = byte(uint16(v) >> 8)
-	}
-	return out, nil
+	return falconEncodePolynomial(poly), nil
 }
 
 func (c *falconHashToPointKeccakPRNG) Name() string { return "FALCON_HASH_TO_POINT_KECCAKPRNG" }
@@ -140,15 +131,9 @@ func falconCoreVerify(sig, pkRaw, challengeRaw []byte) bool {
 	if !ok {
 		return false
 	}
-	var challenge [falconN]int32
-	for i := range challenge {
-		lo := uint16(challengeRaw[2*i])
-		hi := uint16(challengeRaw[2*i+1])
-		v := int32(lo | hi<<8)
-		if v < 0 || v >= falconQ {
-			return false
-		}
-		challenge[i] = v
+	challenge, ok := falconDecodePolynomial(challengeRaw)
+	if !ok {
+		return false
 	}
 	hs2 := falconPolyMul(h, s2)
 	s1 := falconPolySub(challenge, hs2)
@@ -164,17 +149,35 @@ func (c *falconCore) Name() string { return "FALCON_CORE" }
 // Public key decoding
 // ---------------------------------------------------------------------------
 
-// falconDecodePK unpacks falconN 14-bit unsigned coefficients from data.
-// data must be exactly falconPKSize (896) bytes.
-func falconDecodePK(data []byte) ([falconN]int32, bool) {
-	var h [falconN]int32
+// falconEncodePolynomial packs falconN coefficients into the EIP-8052
+// big-endian 14-bit polynomial encoding.
+func falconEncodePolynomial(poly [falconN]int32) []byte {
+	data := make([]byte, falconPKSize)
+	acc := uint64(0)
+	accLen := uint(0)
+	off := 0
+	for _, v := range poly {
+		acc = (acc << 14) | uint64(v)
+		accLen += 14
+		for accLen >= 8 {
+			accLen -= 8
+			data[off] = byte(acc >> accLen)
+			off++
+		}
+	}
+	return data
+}
+
+// falconDecodePolynomial unpacks falconN big-endian 14-bit coefficients.
+func falconDecodePolynomial(data []byte) ([falconN]int32, bool) {
+	var poly [falconN]int32
 	acc := uint32(0)
 	accLen := uint(0)
 	off := 0
 	for i := 0; i < falconN; i++ {
 		for accLen < 14 {
 			if off >= len(data) {
-				return h, false
+				return poly, false
 			}
 			acc = (acc << 8) | uint32(data[off])
 			accLen += 8
@@ -183,14 +186,19 @@ func falconDecodePK(data []byte) ([falconN]int32, bool) {
 		accLen -= 14
 		v := int32((acc >> accLen) & 0x3FFF)
 		if v >= falconQ {
-			return h, false
+			return poly, false
 		}
-		h[i] = v
+		poly[i] = v
 	}
 	if accLen > 0 && acc&((1<<accLen)-1) != 0 {
-		return h, false
+		return poly, false
 	}
-	return h, true
+	return poly, true
+}
+
+// falconDecodePK unpacks a Falcon-512 public key polynomial.
+func falconDecodePK(data []byte) ([falconN]int32, bool) {
+	return falconDecodePolynomial(data)
 }
 
 // ---------------------------------------------------------------------------

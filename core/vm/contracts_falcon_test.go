@@ -89,12 +89,8 @@ func TestFalconHashToPointPrecompilesReturnChallenge(t *testing.T) {
 			if len(ret) != falconChallengeSize {
 				t.Fatalf("unexpected challenge size: got %d want %d", len(ret), falconChallengeSize)
 			}
-			// Verify each 16-bit LE coefficient is in [0, q-1].
-			for i := 0; i < falconN; i++ {
-				v := uint16(ret[2*i]) | uint16(ret[2*i+1])<<8
-				if int(v) >= falconQ {
-					t.Fatalf("challenge[%d] = %d, out of range [0, q-1]", i, v)
-				}
+			if _, ok := falconDecodePolynomial(ret); !ok {
+				t.Fatal("challenge is not a valid packed 14-bit polynomial")
 			}
 		})
 	}
@@ -219,6 +215,42 @@ func TestFalconHashToPointAcceptsVariableMessageLength(t *testing.T) {
 // ---------------------------------------------------------------------------
 // Public key decoding
 // ---------------------------------------------------------------------------
+
+func TestFalconPolynomialEncodingBigEndian(t *testing.T) {
+	var poly [falconN]int32
+	poly[0] = 1
+	poly[1] = 2
+	poly[2] = 0x123
+	poly[3] = falconQ - 1
+
+	got := falconEncodePolynomial(poly)
+	wantPrefix := []byte{0x00, 0x04, 0x00, 0x20, 0x48, 0xf0, 0x00}
+	if !bytes.Equal(got[:len(wantPrefix)], wantPrefix) {
+		t.Fatalf("encoded prefix: got %x, want %x", got[:len(wantPrefix)], wantPrefix)
+	}
+}
+
+func TestFalconPolynomialEncodingRoundTrip(t *testing.T) {
+	var want [falconN]int32
+	for i := range want {
+		want[i] = int32((i * 31) % falconQ)
+	}
+	want[0] = 0
+	want[1] = 1
+	want[2] = falconQ - 1
+
+	encoded := falconEncodePolynomial(want)
+	if len(encoded) != falconChallengeSize {
+		t.Fatalf("encoded size: got %d, want %d", len(encoded), falconChallengeSize)
+	}
+	got, ok := falconDecodePolynomial(encoded)
+	if !ok {
+		t.Fatal("encoded polynomial should decode")
+	}
+	if got != want {
+		t.Fatal("decoded polynomial does not match input")
+	}
+}
 
 func TestFalconDecodePKAllZero(t *testing.T) {
 	data := make([]byte, falconPKSize)

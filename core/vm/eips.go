@@ -570,8 +570,8 @@ func enable8141(jt *JumpTable) {
 	jt[TXPARAMLOAD] = &operation{
 		execute:     opTxParamLoad,
 		constantGas: GasFastStep,
-		minStack:    minStack(3, 1),
-		maxStack:    maxStack(3, 1),
+		minStack:    minStack(1, 1),
+		maxStack:    maxStack(1, 1),
 	}
 	jt[TXPARAMSIZE] = &operation{
 		execute:     opTxParamSize,

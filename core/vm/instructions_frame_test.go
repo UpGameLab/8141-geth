@@ -167,6 +167,33 @@ func TestGetTxParamFrameCompatibilitySelectors(t *testing.T) {
 	}
 }
 
+func TestOpTxParamLoadUsesCompilerStackShape(t *testing.T) {
+	evm, _, _ := newFrameParamTestEVM()
+	evm.FrameCtx.SigHash = common.HexToHash("0x1234")
+	stack := newstack()
+	defer returnStack(stack)
+	scope := &ScopeContext{Stack: stack}
+
+	stack.push(uint256.NewInt(txParamSigHash))
+	if _, err := opTxParamLoad(new(uint64), evm, scope); err != nil {
+		t.Fatal(err)
+	}
+	if stack.len() != 1 {
+		t.Fatalf("stack length: got %d, want 1", stack.len())
+	}
+	if value := stack.pop(); value.Bytes32() != evm.FrameCtx.SigHash {
+		t.Fatalf("sig hash: got %x, want %x", value.Bytes32(), evm.FrameCtx.SigHash)
+	}
+
+	stack.push(uint256.NewInt(txParamCurrentFrame))
+	if _, err := opTxParamLoad(new(uint64), evm, scope); err != nil {
+		t.Fatal(err)
+	}
+	if value := stack.pop(); value.Uint64() != uint64(evm.FrameCtx.FrameIndex) {
+		t.Fatalf("current frame: got %v, want %d", &value, evm.FrameCtx.FrameIndex)
+	}
+}
+
 func TestOpFrameParamSupportsFrameZero(t *testing.T) {
 	evm, _, _ := newFrameParamTestEVM()
 	if op := newPragueInstructionSet()[FRAMEPARAM]; op == nil || op.undefined || op.execute == nil {
@@ -186,5 +213,24 @@ func TestOpFrameParamSupportsFrameZero(t *testing.T) {
 	}
 	if value := stack.pop(); value.Uint64() != 111 {
 		t.Fatalf("frame zero gas: got %v, want 111", &value)
+	}
+}
+
+func TestOpcodeRegistration(t *testing.T) {
+	for name, jumpTable := range map[string]JumpTable{
+		"Prague": newPragueInstructionSet(),
+		"Osaka":  newOsakaInstructionSet(),
+	} {
+		t.Run(name, func(t *testing.T) {
+			for _, opcode := range []OpCode{TXPARAMLOAD, FRAMEPARAM} {
+				op := jumpTable[opcode]
+				if op == nil || op.undefined || op.execute == nil {
+					t.Fatalf("%s is not registered", opcode)
+				}
+			}
+			if op := jumpTable[TXPARAMLOAD]; op.minStack != minStack(1, 1) || op.maxStack != maxStack(1, 1) {
+				t.Fatal("TXPARAMLOAD does not use the compiler's one-input stack shape")
+			}
+		})
 	}
 }
