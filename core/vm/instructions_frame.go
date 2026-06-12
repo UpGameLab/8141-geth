@@ -27,27 +27,41 @@ import (
 // Approval status codes as returned by APPROVE and observable via call status.
 const (
 	ApproveNone      uint8 = 0 // No approval (normal RETURN or not set).
-	ApproveExecution uint8 = 2 // APPROVE(0x0): sender approved execution.
+	ApproveExecution uint8 = 2 // APPROVE(0x2): sender approved execution.
 	ApprovePayment   uint8 = 3 // APPROVE(0x1): payer approved payment.
-	ApproveBoth      uint8 = 4 // APPROVE(0x2): both execution and payment.
+	ApproveBoth      uint8 = 4 // APPROVE(0x3): both execution and payment.
 )
+
+// approvalStatus maps the APPROVE bitmask scope to its internal status code.
+func approvalStatus(scope uint64) (uint8, bool) {
+	switch scope {
+	case 1:
+		return ApprovePayment, true
+	case 2:
+		return ApproveExecution, true
+	case 3:
+		return ApproveBoth, true
+	default:
+		return ApproveNone, false
+	}
+}
 
 // FrameContext holds the context for executing a frame transaction (EIP-8141).
 // It is set on the EVM when processing a frame transaction and provides data
 // needed by the TXPARAM* opcodes. All fields are populated from the flattened
 // Message during executeFrames().
 type FrameContext struct {
-	Sender       common.Address  // tx.sender
-	Nonce        uint64          // tx.nonce
-	Frames       []types.Frame   // tx.frames
-	GasTipCap    *uint256.Int    // max_priority_fee_per_gas
-	GasFeeCap    *uint256.Int    // max_fee_per_gas
-	BlobFeeCap   *uint256.Int    // max_fee_per_blob_gas
-	BlobHashes   []common.Hash   // blob_versioned_hashes
-	GasLimit     uint64          // Total gas limit (intrinsic + calldata + sum(frame.gas_limit))
-	SigHash      common.Hash     // Cached compute_sig_hash(tx).
-	FrameIndex   int             // Currently executing frame index.
-	FrameResults []uint8         // Status of each completed frame (0=fail, 1=success, 2-4=approve).
+	Sender       common.Address // tx.sender
+	Nonce        uint64         // tx.nonce
+	Frames       []types.Frame  // tx.frames
+	GasTipCap    *uint256.Int   // max_priority_fee_per_gas
+	GasFeeCap    *uint256.Int   // max_fee_per_gas
+	BlobFeeCap   *uint256.Int   // max_fee_per_blob_gas
+	BlobHashes   []common.Hash  // blob_versioned_hashes
+	GasLimit     uint64         // Total gas limit (intrinsic + calldata + sum(frame.gas_limit))
+	SigHash      common.Hash    // Cached compute_sig_hash(tx).
+	FrameIndex   int            // Currently executing frame index.
+	FrameResults []uint8        // Status of each completed frame (0=fail, 1=success, 2-4=approve).
 }
 
 // opApprove implements the APPROVE opcode (0xaa) as defined in EIP-8141.
@@ -59,7 +73,7 @@ type FrameContext struct {
 //   - ADDRESS == frame.target: only the frame target contract can call APPROVE.
 //     This prevents subcalls from issuing approvals. DELEGATECALL preserves
 //     ADDRESS, so delegate patterns still work.
-//   - Scope 0x0/0x2 (execution approval): frame.target must equal tx.sender,
+//   - Scope 0x2/0x3 (execution approval): frame.target must equal tx.sender,
 //     since only the sender contract can approve execution.
 //
 // Stack: [offset, length, scope]
@@ -67,9 +81,9 @@ func opApprove(pc *uint64, evm *EVM, scope *ScopeContext) ([]byte, error) {
 	offset, size := scope.Stack.pop(), scope.Stack.pop()
 	scopeVal := scope.Stack.pop()
 
-	// Validate scope: must be 0, 1, or 2.
 	s := scopeVal.Uint64()
-	if s > 2 {
+	status, ok := approvalStatus(s)
+	if !ok {
 		return nil, &ErrInvalidOpCode{opcode: APPROVE}
 	}
 
@@ -88,13 +102,12 @@ func opApprove(pc *uint64, evm *EVM, scope *ScopeContext) ([]byte, error) {
 		return nil, &ErrInvalidOpCode{opcode: APPROVE}
 	}
 
-	// Scope 0x0/0x2 (execution approval): frame.target must be tx.sender.
-	if (s == 0 || s == 2) && frameTarget != evm.FrameCtx.Sender {
+	// Execution approval requires frame.target to be tx.sender.
+	if (status == ApproveExecution || status == ApproveBoth) && frameTarget != evm.FrameCtx.Sender {
 		return nil, &ErrInvalidOpCode{opcode: APPROVE}
 	}
 
-	// Map scope operand to approval status code: scope + 2.
-	evm.ApproveScope = uint8(s) + 2
+	evm.ApproveScope = status
 
 	ret := scope.Memory.GetCopy(offset.Uint64(), size.Uint64())
 	return ret, errStopToken
@@ -208,6 +221,23 @@ func getFrameParam(evm *EVM, in1, in2 uint64, opcode OpCode) ([]byte, error) {
 	}
 }
 
+// getFrameData returns the calldata for a frame. VERIFY frame data is elided
+// from cross-frame reads, matching the signature-hash rules.
+func getFrameData(evm *EVM, frameIndex uint64, opcode OpCode) ([]byte, error) {
+	fc := evm.FrameCtx
+	if fc == nil {
+		return nil, ErrWriteProtection
+	}
+	if frameIndex >= uint64(len(fc.Frames)) {
+		return nil, &ErrInvalidOpCode{opcode: opcode}
+	}
+	frame := &fc.Frames[frameIndex]
+	if frame.Mode == types.FrameModeVerify {
+		return nil, nil
+	}
+	return frame.Data, nil
+}
+
 // getTxParam returns the byte slice for the given tx parameter.
 // For fixed 32-byte params, it returns a 32-byte big-endian value.
 // For dynamic params (frame data), it returns the raw bytes.
@@ -296,16 +326,7 @@ func getTxParam(evm *EVM, in1, in2 uint64) ([]byte, error) {
 		return getFrameParam(evm, frameParamTarget, in2, TXPARAMLOAD)
 
 	case txParamFrameData:
-		if in2 >= uint64(len(fc.Frames)) {
-			return nil, &ErrInvalidOpCode{opcode: TXPARAMLOAD}
-		}
-		idx := int(in2)
-		f := &fc.Frames[idx]
-		// VERIFY frames return empty data.
-		if f.Mode == types.FrameModeVerify {
-			return nil, nil
-		}
-		return f.Data, nil
+		return getFrameData(evm, in2, TXPARAMLOAD)
 
 	case txParamFrameGas:
 		return getFrameParam(evm, frameParamGas, in2, TXPARAMLOAD)
@@ -348,74 +369,60 @@ func opTxParamLoad(pc *uint64, evm *EVM, scope *ScopeContext) ([]byte, error) {
 	return nil, nil
 }
 
-// opTxParamSize implements TXPARAMSIZE (0xb1).
-// Stack: [in1, in2] → [size]
-func opTxParamSize(pc *uint64, evm *EVM, scope *ScopeContext) ([]byte, error) {
-	in1 := scope.Stack.pop()
-	in2 := scope.Stack.peek()
+// opFrameDataLoad implements FRAMEDATALOAD (0xb1).
+// Stack: [offset, frameIndex] → [value]
+func opFrameDataLoad(pc *uint64, evm *EVM, scope *ScopeContext) ([]byte, error) {
+	offset := scope.Stack.pop()
+	frameIndex := scope.Stack.peek()
 
-	data, err := getTxParam(evm, in1.Uint64(), in2.Uint64())
+	data, err := getFrameData(evm, frameIndex.Uint64(), TXPARAMSIZE)
 	if err != nil {
 		return nil, err
 	}
 
-	in2.SetUint64(uint64(len(data)))
-	return nil, nil
-}
-
-// opTxParamCopy implements TXPARAMCOPY (0xb2).
-// Stack: [in1, in2, destOffset, offset, size]
-func opTxParamCopy(pc *uint64, evm *EVM, scope *ScopeContext) ([]byte, error) {
-	in1 := scope.Stack.pop()
-	in2 := scope.Stack.pop()
-	memOffset := scope.Stack.pop()
-	dataOffset := scope.Stack.pop()
-	length := scope.Stack.pop()
-
-	data, err := getTxParam(evm, in1.Uint64(), in2.Uint64())
-	if err != nil {
-		return nil, err
-	}
-
-	dataOff64 := dataOffset.Uint64()
-	len64 := length.Uint64()
-
-	// Build the padded copy. Guard against dataOff64+len64 overflowing uint64.
-	var end uint64
-	if dataOff64 > ^uint64(0)-len64 {
-		end = uint64(len(data))
-	} else {
-		end = dataOff64 + len64
+	var word [32]byte
+	off := offset.Uint64()
+	if off < uint64(len(data)) {
+		end := off + 32
 		if end > uint64(len(data)) {
 			end = uint64(len(data))
 		}
+		copy(word[:], data[off:end])
 	}
-	var padded []byte
-	if dataOff64 < uint64(len(data)) {
-		padded = common.RightPadBytes(data[dataOff64:end], int(len64))
-	} else {
-		padded = make([]byte, len64)
-	}
-
-	scope.Memory.Set(memOffset.Uint64(), len64, padded)
+	frameIndex.SetBytes32(word[:])
 	return nil, nil
 }
 
-// memoryTxParamCopy returns the memory size required for TXPARAMCOPY.
-// Stack layout: [in1, in2, destOffset, offset, size]
-// destOffset is at Back(2), size at Back(4).
-func memoryTxParamCopy(stack *Stack) (uint64, bool) {
-	return calcMemSize64(stack.Back(2), stack.Back(4))
+// opFrameDataCopy implements FRAMEDATACOPY (0xb2).
+// Stack: [destOffset, offset, size, frameIndex]
+func opFrameDataCopy(pc *uint64, evm *EVM, scope *ScopeContext) ([]byte, error) {
+	memOffset := scope.Stack.pop()
+	dataOffset := scope.Stack.pop()
+	length := scope.Stack.pop()
+	frameIndex := scope.Stack.pop()
+
+	data, err := getFrameData(evm, frameIndex.Uint64(), TXPARAMCOPY)
+	if err != nil {
+		return nil, err
+	}
+
+	scope.Memory.Set(memOffset.Uint64(), length.Uint64(), getData(data, dataOffset.Uint64(), length.Uint64()))
+	return nil, nil
 }
 
-// gasTxParamCopy calculates dynamic gas for TXPARAMCOPY.
-// Stack layout: [in1, in2, destOffset, offset, size] — size is Back(4).
-func gasTxParamCopy(evm *EVM, contract *Contract, stack *Stack, mem *Memory, memorySize uint64) (uint64, error) {
+// memoryFrameDataCopy returns the memory size required for FRAMEDATACOPY.
+// Stack layout: [destOffset, offset, size, frameIndex].
+func memoryFrameDataCopy(stack *Stack) (uint64, bool) {
+	return calcMemSize64(stack.Back(0), stack.Back(2))
+}
+
+// gasFrameDataCopy calculates dynamic gas for FRAMEDATACOPY.
+func gasFrameDataCopy(evm *EVM, contract *Contract, stack *Stack, mem *Memory, memorySize uint64) (uint64, error) {
 	gas, err := memoryGasCost(mem, memorySize)
 	if err != nil {
 		return 0, err
 	}
-	words, overflow := stack.Back(4).Uint64WithOverflow()
+	words, overflow := stack.Back(2).Uint64WithOverflow()
 	if overflow {
 		return 0, ErrGasUintOverflow
 	}

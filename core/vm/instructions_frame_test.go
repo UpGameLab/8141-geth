@@ -22,6 +22,7 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/params"
 	"github.com/holiman/uint256"
 )
 
@@ -30,8 +31,14 @@ func newFrameParamTestEVM() (*EVM, common.Address, common.Address) {
 	target := common.HexToAddress("0x2222222222222222222222222222222222222222")
 	return &EVM{
 		FrameCtx: &FrameContext{
-			Sender: sender,
-			Nonce:  99,
+			Sender:     sender,
+			Nonce:      99,
+			GasTipCap:  uint256.NewInt(7),
+			GasFeeCap:  uint256.NewInt(11),
+			BlobFeeCap: uint256.NewInt(13),
+			BlobHashes: []common.Hash{common.HexToHash("0xbeef")},
+			GasLimit:   1000,
+			SigHash:    common.HexToHash("0x1234"),
 			Frames: []types.Frame{
 				{
 					Mode:     types.FrameModeDefault,
@@ -167,6 +174,77 @@ func TestGetTxParamFrameCompatibilitySelectors(t *testing.T) {
 	}
 }
 
+func TestGetTxParamSelectors(t *testing.T) {
+	evm, sender, target := newFrameParamTestEVM()
+	fc := evm.FrameCtx
+	blobCost := uint256.NewInt(params.BlobTxBlobGasPerBlob)
+	blobCost.Mul(blobCost, fc.BlobFeeCap)
+	maxCost := uint256.NewInt(fc.GasLimit)
+	maxCost.Mul(maxCost, fc.GasFeeCap).Add(maxCost, blobCost)
+
+	tests := []struct {
+		name     string
+		selector uint64
+		index    uint64
+		want     []byte
+	}{
+		{"type", txParamTxType, 0, bytes32(uint256.NewInt(uint64(types.FrameTxType)))},
+		{"nonce", txParamNonce, 0, bytes32(uint256.NewInt(fc.Nonce))},
+		{"sender", txParamSender, 0, common.LeftPadBytes(sender.Bytes(), 32)},
+		{"tip cap", txParamGasTipCap, 0, bytes32(fc.GasTipCap)},
+		{"fee cap", txParamGasFeeCap, 0, bytes32(fc.GasFeeCap)},
+		{"blob fee cap", txParamBlobFeeCap, 0, bytes32(fc.BlobFeeCap)},
+		{"max cost", txParamMaxCost, 0, bytes32(maxCost)},
+		{"blob hash length", txParamBlobHashLen, 0, bytes32(uint256.NewInt(1))},
+		{"sig hash", txParamSigHash, 0, fc.SigHash[:]},
+		{"frame count", txParamFrameCount, 0, bytes32(uint256.NewInt(2))},
+		{"current frame", txParamCurrentFrame, 0, bytes32(uint256.NewInt(2))},
+		{"legacy frame index", txParamFrameIdx, 0, bytes32(uint256.NewInt(2))},
+		{"frame target", txParamFrameTarget, 1, common.LeftPadBytes(target.Bytes(), 32)},
+		{"frame data", txParamFrameData, 1, []byte{0xaa, 0xbb, 0xcc}},
+		{"frame gas", txParamFrameGas, 1, bytes32(uint256.NewInt(222))},
+		{"frame mode", txParamFrameMode, 1, bytes32(uint256.NewInt(uint64(types.FrameModeSender)))},
+		{"frame status", txParamFrameStatus, 1, bytes32(uint256.NewInt(uint64(ApproveBoth)))},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := getTxParam(evm, test.selector, test.index)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(got, test.want) {
+				t.Fatalf("selector %#x: got %x, want %x", test.selector, got, test.want)
+			}
+		})
+	}
+
+	for selector := uint64(0x0b); selector <= 0x0f; selector++ {
+		if _, err := getTxParam(evm, selector, 0); err == nil {
+			t.Fatalf("selector %#x: expected error", selector)
+		}
+	}
+}
+
+func TestApprovalStatusCompatibility(t *testing.T) {
+	tests := []struct {
+		scope uint64
+		want  uint8
+		ok    bool
+	}{
+		{0, ApproveNone, false},
+		{1, ApprovePayment, true},
+		{2, ApproveExecution, true},
+		{3, ApproveBoth, true},
+		{4, ApproveNone, false},
+	}
+	for _, test := range tests {
+		got, ok := approvalStatus(test.scope)
+		if got != test.want || ok != test.ok {
+			t.Fatalf("scope %#x: got (%d, %t), want (%d, %t)", test.scope, got, ok, test.want, test.ok)
+		}
+	}
+}
+
 func TestOpTxParamLoadUsesCompilerStackShape(t *testing.T) {
 	evm, _, _ := newFrameParamTestEVM()
 	evm.FrameCtx.SigHash = common.HexToHash("0x1234")
@@ -191,6 +269,58 @@ func TestOpTxParamLoadUsesCompilerStackShape(t *testing.T) {
 	}
 	if value := stack.pop(); value.Uint64() != uint64(evm.FrameCtx.FrameIndex) {
 		t.Fatalf("current frame: got %v, want %d", &value, evm.FrameCtx.FrameIndex)
+	}
+}
+
+func TestOpFrameDataLoadUsesCompilerStackShape(t *testing.T) {
+	evm, _, _ := newFrameParamTestEVM()
+	stack := newstack()
+	defer returnStack(stack)
+	scope := &ScopeContext{Stack: stack}
+
+	stack.push(uint256.NewInt(1))
+	stack.push(uint256.NewInt(1))
+	if _, err := opFrameDataLoad(new(uint64), evm, scope); err != nil {
+		t.Fatal(err)
+	}
+	if stack.len() != 1 {
+		t.Fatalf("stack length: got %d, want 1", stack.len())
+	}
+	want := common.RightPadBytes([]byte{0xbb, 0xcc}, 32)
+	if value := stack.pop(); !bytes.Equal(value.Bytes(), want) {
+		t.Fatalf("frame data word: got %x, want %x", value.Bytes(), want)
+	}
+
+	stack.push(uint256.NewInt(0))
+	stack.push(uint256.NewInt(0))
+	if _, err := opFrameDataLoad(new(uint64), evm, scope); err != nil {
+		t.Fatal(err)
+	}
+	if value := stack.pop(); !value.IsZero() {
+		t.Fatalf("VERIFY frame data: got %x, want zero", value.Bytes())
+	}
+}
+
+func TestOpFrameDataCopyUsesCompilerStackShape(t *testing.T) {
+	evm, _, _ := newFrameParamTestEVM()
+	stack := newstack()
+	defer returnStack(stack)
+	scope := &ScopeContext{Stack: stack, Memory: NewMemory()}
+	scope.Memory.Resize(12)
+
+	stack.push(uint256.NewInt(1))
+	stack.push(uint256.NewInt(4))
+	stack.push(uint256.NewInt(1))
+	stack.push(uint256.NewInt(8))
+	if _, err := opFrameDataCopy(new(uint64), evm, scope); err != nil {
+		t.Fatal(err)
+	}
+	if stack.len() != 0 {
+		t.Fatalf("stack length: got %d, want 0", stack.len())
+	}
+	want := []byte{0xbb, 0xcc, 0x00, 0x00}
+	if got := scope.Memory.GetCopy(8, 4); !bytes.Equal(got, want) {
+		t.Fatalf("frame data copy: got %x, want %x", got, want)
 	}
 }
 
@@ -222,7 +352,7 @@ func TestOpcodeRegistration(t *testing.T) {
 		"Osaka":  newOsakaInstructionSet(),
 	} {
 		t.Run(name, func(t *testing.T) {
-			for _, opcode := range []OpCode{TXPARAMLOAD, FRAMEPARAM} {
+			for _, opcode := range []OpCode{TXPARAMLOAD, TXPARAMSIZE, TXPARAMCOPY, FRAMEPARAM} {
 				op := jumpTable[opcode]
 				if op == nil || op.undefined || op.execute == nil {
 					t.Fatalf("%s is not registered", opcode)
@@ -230,6 +360,12 @@ func TestOpcodeRegistration(t *testing.T) {
 			}
 			if op := jumpTable[TXPARAMLOAD]; op.minStack != minStack(1, 1) || op.maxStack != maxStack(1, 1) {
 				t.Fatal("TXPARAMLOAD does not use the compiler's one-input stack shape")
+			}
+			if op := jumpTable[TXPARAMSIZE]; op.minStack != minStack(2, 1) || op.maxStack != maxStack(2, 1) {
+				t.Fatal("FRAMEDATALOAD does not use the compiler's two-input stack shape")
+			}
+			if op := jumpTable[TXPARAMCOPY]; op.minStack != minStack(4, 0) || op.maxStack != maxStack(4, 0) {
+				t.Fatal("FRAMEDATACOPY does not use the compiler's four-input stack shape")
 			}
 		})
 	}

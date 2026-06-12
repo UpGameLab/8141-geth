@@ -38,8 +38,8 @@ type testChain struct {
 	head    *types.Header
 }
 
-func (c *testChain) Config() *params.ChainConfig        { return c.config }
-func (c *testChain) CurrentBlock() *types.Header         { return c.head }
+func (c *testChain) Config() *params.ChainConfig                 { return c.config }
+func (c *testChain) CurrentBlock() *types.Header                 { return c.head }
 func (c *testChain) StateAt(common.Hash) (*state.StateDB, error) { return c.statedb, nil }
 
 // reserver implements txpool.Reserver for tests.
@@ -78,33 +78,33 @@ func (r *reserver) Has(addr common.Address) bool {
 
 // Bytecode constants.
 var (
-	// APPROVE(0x2): PUSH1 0x02, PUSH1 0x00, PUSH1 0x00, APPROVE(0xaa)
-	approveBothCode = []byte{0x60, 0x02, 0x60, 0x00, 0x60, 0x00, 0xaa}
+	// APPROVE(0x3): PUSH1 0x02, PUSH1 0x00, PUSH1 0x00, APPROVE(0xaa)
+	approveBothCode = []byte{0x60, 0x03, 0x60, 0x00, 0x60, 0x00, 0xaa}
 
-	// APPROVE(0x0): PUSH1 0x00, PUSH1 0x00, PUSH1 0x00, APPROVE(0xaa)
-	approveExecCode = []byte{0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0xaa}
+	// APPROVE(0x2): PUSH1 0x00, PUSH1 0x00, PUSH1 0x00, APPROVE(0xaa)
+	approveExecCode = []byte{0x60, 0x02, 0x60, 0x00, 0x60, 0x00, 0xaa}
 
 	// Simple RETURN: PUSH1 0x00, PUSH1 0x00, RETURN(0xf3)
 	returnCode = []byte{0x60, 0x00, 0x60, 0x00, 0xf3}
 
-	// TIMESTAMP then APPROVE(0x2): TIMESTAMP, PUSH1 0x02, PUSH1 0x00, PUSH1 0x00, APPROVE(0xaa)
+	// TIMESTAMP then APPROVE(0x3): TIMESTAMP, PUSH1 0x02, PUSH1 0x00, PUSH1 0x00, APPROVE(0xaa)
 	// For use in VERIFY frames only (proves TIMESTAMP is OP-011 banned in VERIFY).
-	timestampThenApproveCode = []byte{0x42, 0x60, 0x02, 0x60, 0x00, 0x60, 0x00, 0xaa}
+	timestampThenApproveCode = []byte{0x42, 0x60, 0x03, 0x60, 0x00, 0x60, 0x00, 0xaa}
 
 	// TIMESTAMP then RETURN: TIMESTAMP(0x42), POP(0x50), PUSH1 0x00, PUSH1 0x00, RETURN(0xf3)
 	// For use in DEFAULT frames to verify TIMESTAMP is not banned outside VERIFY context.
 	timestampThenReturnCode = []byte{0x42, 0x50, 0x60, 0x00, 0x60, 0x00, 0xf3}
 
-	// GAS, ADD (OP-012 violation), then APPROVE(0x2):
+	// GAS, ADD (OP-012 violation), then APPROVE(0x3):
 	// GAS(0x5a), PUSH1 0x00, ADD(0x01), POP(0x50), PUSH1 0x02, PUSH1 0x00, PUSH1 0x00, APPROVE(0xaa)
-	gasAddThenApproveCode = []byte{0x5a, 0x60, 0x00, 0x01, 0x50, 0x60, 0x02, 0x60, 0x00, 0x60, 0x00, 0xaa}
+	gasAddThenApproveCode = []byte{0x5a, 0x60, 0x00, 0x01, 0x50, 0x60, 0x03, 0x60, 0x00, 0x60, 0x00, 0xaa}
 
-	// BALANCE (OP-080 violation) then APPROVE(0x2):
-	// PUSH20 <addr>, BALANCE(0x31), POP, APPROVE(0x2)
+	// BALANCE (OP-080 violation) then APPROVE(0x3):
+	// PUSH20 <addr>, BALANCE(0x31), POP, APPROVE(0x3)
 	// PUSH20 0x00..00, BALANCE, POP, PUSH1 0x02, PUSH1 0x00, PUSH1 0x00, APPROVE
 	balanceThenApproveCode = append(
 		append([]byte{0x73}, make([]byte, 20)...), // PUSH20 0x00..00
-		0x31, 0x50, 0x60, 0x02, 0x60, 0x00, 0x60, 0x00, 0xaa,
+		0x31, 0x50, 0x60, 0x03, 0x60, 0x00, 0x60, 0x00, 0xaa,
 	)
 
 	// APPROVE(0x1) — payment approval: PUSH1 0x01, PUSH1 0x00, PUSH1 0x00, APPROVE(0xaa)
@@ -373,7 +373,7 @@ func TestFramePoolDefaultFrameSkipsValidation(t *testing.T) {
 
 	ftx := baseFTX(sender, 0, config)
 	ftx.Frames = []types.Frame{
-		{Mode: types.FrameModeVerify, Target: nil, GasLimit: 50000, Data: []byte{0x01}},     // VERIFY on sender (valid)
+		{Mode: types.FrameModeVerify, Target: nil, GasLimit: 50000, Data: []byte{0x01}},      // VERIFY on sender (valid)
 		{Mode: types.FrameModeDefault, Target: &target, GasLimit: 50000, Data: []byte{0x01}}, // DEFAULT on target (no opcode restrictions)
 	}
 
@@ -486,8 +486,8 @@ func TestScopeOrderingExecThenPay(t *testing.T) {
 
 	ftx := baseFTX(sender, 0, config)
 	ftx.Frames = []types.Frame{
-		{Mode: types.FrameModeVerify, Target: nil, GasLimit: 50000, Data: []byte{0x01}},      // sender → exec
-		{Mode: types.FrameModeVerify, Target: &payer, GasLimit: 50000, Data: []byte{0x01}},    // payer → pay
+		{Mode: types.FrameModeVerify, Target: nil, GasLimit: 50000, Data: []byte{0x01}},    // sender → exec
+		{Mode: types.FrameModeVerify, Target: &payer, GasLimit: 50000, Data: []byte{0x01}}, // payer → pay
 		{Mode: types.FrameModeDefault, Target: &target, GasLimit: 50000, Data: []byte{0x01}},
 	}
 
@@ -510,8 +510,8 @@ func TestScopeOrderingPayBeforeExec(t *testing.T) {
 
 	ftx := baseFTX(sender, 0, config)
 	ftx.Frames = []types.Frame{
-		{Mode: types.FrameModeVerify, Target: &payer, GasLimit: 50000, Data: []byte{0x01}},  // payer → pay (before exec!)
-		{Mode: types.FrameModeVerify, Target: nil, GasLimit: 50000, Data: []byte{0x01}},     // sender → exec
+		{Mode: types.FrameModeVerify, Target: &payer, GasLimit: 50000, Data: []byte{0x01}}, // payer → pay (before exec!)
+		{Mode: types.FrameModeVerify, Target: nil, GasLimit: 50000, Data: []byte{0x01}},    // sender → exec
 	}
 
 	errs := pool.Add([]*types.Transaction{makeFrameTx(ftx)}, false)
@@ -537,9 +537,9 @@ func TestScopeOrderingDoublePayer(t *testing.T) {
 
 	ftx := baseFTX(sender, 0, config)
 	ftx.Frames = []types.Frame{
-		{Mode: types.FrameModeVerify, Target: nil, GasLimit: 50000, Data: []byte{0x01}},       // sender → exec
-		{Mode: types.FrameModeVerify, Target: &payerA, GasLimit: 50000, Data: []byte{0x01}},   // payerA → pay
-		{Mode: types.FrameModeVerify, Target: &payerB, GasLimit: 50000, Data: []byte{0x01}},   // payerB → pay (duplicate!)
+		{Mode: types.FrameModeVerify, Target: nil, GasLimit: 50000, Data: []byte{0x01}},     // sender → exec
+		{Mode: types.FrameModeVerify, Target: &payerA, GasLimit: 50000, Data: []byte{0x01}}, // payerA → pay
+		{Mode: types.FrameModeVerify, Target: &payerB, GasLimit: 50000, Data: []byte{0x01}}, // payerB → pay (duplicate!)
 	}
 
 	errs := pool.Add([]*types.Transaction{makeFrameTx(ftx)}, false)
@@ -562,8 +562,8 @@ func TestScopeOrderingBothAfterExec(t *testing.T) {
 
 	ftx := baseFTX(sender, 0, config)
 	ftx.Frames = []types.Frame{
-		{Mode: types.FrameModeVerify, Target: nil, GasLimit: 50000, Data: []byte{0x01}},     // sender → exec
-		{Mode: types.FrameModeVerify, Target: &payer, GasLimit: 50000, Data: []byte{0x01}},  // payer → both (exec already done!)
+		{Mode: types.FrameModeVerify, Target: nil, GasLimit: 50000, Data: []byte{0x01}},    // sender → exec
+		{Mode: types.FrameModeVerify, Target: &payer, GasLimit: 50000, Data: []byte{0x01}}, // payer → both (exec already done!)
 	}
 
 	errs := pool.Add([]*types.Transaction{makeFrameTx(ftx)}, false)
@@ -584,7 +584,7 @@ func TestScopeOrderingNoPayer(t *testing.T) {
 
 	ftx := baseFTX(sender, 0, config)
 	ftx.Frames = []types.Frame{
-		{Mode: types.FrameModeVerify, Target: nil, GasLimit: 50000, Data: []byte{0x01}},        // sender → exec only
+		{Mode: types.FrameModeVerify, Target: nil, GasLimit: 50000, Data: []byte{0x01}}, // sender → exec only
 		{Mode: types.FrameModeDefault, Target: &target, GasLimit: 50000, Data: []byte{0x01}},
 	}
 
@@ -596,28 +596,28 @@ func TestScopeOrderingNoPayer(t *testing.T) {
 }
 
 // TestApproveCallerNonSenderExec tests the new EIP-8141 APPROVE CALLER check:
-// a non-sender target calling APPROVE(0x0) should be rejected because
-// scope 0 requires ADDRESS == tx.sender.
+// a non-sender target calling APPROVE(0x2) should be rejected because
+// scope 2 requires ADDRESS == tx.sender.
 func TestApproveCallerNonSenderExec(t *testing.T) {
 	pool, statedb, config := newTestEnv()
 
 	sender := common.HexToAddress("0x1111111111111111111111111111111111111111")
 	payer := common.HexToAddress("0x2222222222222222222222222222222222222222")
 	statedb.CreateAccount(sender)
-	statedb.SetCode(sender, approveExecCode, tracing.CodeChangeUnspecified) // APPROVE(0x0) — valid from sender
+	statedb.SetCode(sender, approveExecCode, tracing.CodeChangeUnspecified) // APPROVE(0x2) — valid from sender
 	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
 	statedb.CreateAccount(payer)
-	statedb.SetCode(payer, approveExecCode, tracing.CodeChangeUnspecified) // APPROVE(0x0) — payer tries exec approval
+	statedb.SetCode(payer, approveExecCode, tracing.CodeChangeUnspecified) // APPROVE(0x2) — payer tries exec approval
 
 	ftx := baseFTX(sender, 0, config)
 	ftx.Frames = []types.Frame{
-		{Mode: types.FrameModeVerify, Target: nil, GasLimit: 50000, Data: []byte{0x01}},     // sender → exec ✓
-		{Mode: types.FrameModeVerify, Target: &payer, GasLimit: 50000, Data: []byte{0x01}},   // payer → exec ✗ (ADDRESS != sender)
+		{Mode: types.FrameModeVerify, Target: nil, GasLimit: 50000, Data: []byte{0x01}},    // sender → exec ✓
+		{Mode: types.FrameModeVerify, Target: &payer, GasLimit: 50000, Data: []byte{0x01}}, // payer → exec ✗ (ADDRESS != sender)
 	}
 
 	errs := pool.Add([]*types.Transaction{makeFrameTx(ftx)}, false)
 	if errs[0] == nil {
-		t.Fatal("expected rejection: non-sender target cannot APPROVE(0x0)")
+		t.Fatal("expected rejection: non-sender target cannot APPROVE(0x2)")
 	}
 	t.Logf("correctly rejected: %v", errs[0])
 }

@@ -38,7 +38,7 @@ const (
 )
 
 const (
-	falconEOAInputSize = 2 + falconPKSize + falconSigSize
+	currentFalconEOAInputSize = 1 + falconPKSize + falconSigSize
 )
 
 // Gas costs for EOA default code operations.
@@ -62,9 +62,20 @@ type eoaCallRLP struct {
 // appropriate action (signature verification, call execution, or revert).
 //
 // Returns the return data, leftover gas, and any error.
-func ExecuteDefaultCode(evm *EVM, caller common.Address, target common.Address, input []byte, gas uint64, _ uint8) ([]byte, uint64, error) {
+func ExecuteDefaultCode(evm *EVM, caller common.Address, target common.Address, input []byte, gas uint64, frameMode uint8) ([]byte, uint64, error) {
 	if len(input) == 0 {
 		return nil, gas, ErrExecutionReverted
+	}
+
+	// Current frame transactions carry mode and APPROVE scope in the frame
+	// fields. Keep accepting the legacy embedded header for older clients and
+	// the existing Falcon EOA encoding.
+	if frameMode == types.FrameModeVerify && isCurrentEOAVerifyInput(input) {
+		scope, ok := currentFrameApproveScope(evm)
+		if !ok {
+			return nil, gas, ErrExecutionReverted
+		}
+		return executeDefaultVerify(evm, target, input, gas, scope, true)
 	}
 
 	firstByte := input[0]
@@ -73,7 +84,7 @@ func ExecuteDefaultCode(evm *EVM, caller common.Address, target common.Address, 
 
 	switch dataMode {
 	case types.FrameModeVerify:
-		return executeDefaultVerify(evm, target, input, gas, scope)
+		return executeDefaultVerify(evm, target, input, gas, scope, false)
 	case types.FrameModeSender:
 		return executeDefaultSender(evm, target, input, gas, scope)
 	case types.FrameModeDefault:
@@ -83,10 +94,31 @@ func ExecuteDefaultCode(evm *EVM, caller common.Address, target common.Address, 
 	}
 }
 
+func isCurrentEOAVerifyInput(input []byte) bool {
+	switch input[0] {
+	case sigTypeSecp256k1:
+		return len(input) == 1+65
+	case sigTypeP256:
+		return len(input) == 1+128
+	case sigTypeFalcon, sigTypeFalconEth:
+		return len(input) == currentFalconEOAInputSize
+	default:
+		return false
+	}
+}
+
+func currentFrameApproveScope(evm *EVM) (uint8, bool) {
+	fc := evm.FrameCtx
+	if fc == nil || fc.FrameIndex < 0 || fc.FrameIndex >= len(fc.Frames) {
+		return 0, false
+	}
+	return fc.Frames[fc.FrameIndex].Flags & frameParamApproveScopeMask, true
+}
+
 // executeDefaultVerify implements the VERIFY mode of the EOA default code.
 // It verifies a signature (secp256k1 or P256) against the transaction's
 // signature hash and calls APPROVE on success.
-func executeDefaultVerify(evm *EVM, target common.Address, input []byte, gas uint64, scope uint8) ([]byte, uint64, error) {
+func executeDefaultVerify(evm *EVM, target common.Address, input []byte, gas uint64, scope uint8, current bool) ([]byte, uint64, error) {
 	fc := evm.FrameCtx
 	if fc == nil {
 		return nil, gas, ErrExecutionReverted
@@ -103,35 +135,53 @@ func executeDefaultVerify(evm *EVM, target common.Address, input []byte, gas uin
 	}
 	gas -= defaultCodeBaseGas
 
-	// Must have at least 2 bytes (first byte + signature_type).
-	if len(input) < 2 {
-		return nil, gas, ErrExecutionReverted
+	var sigType byte
+	var payload, legacyHeader []byte
+	if current {
+		sigType = input[0]
+		payload = input[1:]
+	} else {
+		// Legacy format: embedded mode/scope byte followed by signature type.
+		if len(input) < 2 {
+			return nil, gas, ErrExecutionReverted
+		}
+		sigType = input[1]
+		payload = input[2:]
+		legacyHeader = input[:2]
 	}
-
-	sigType := input[1]
 
 	switch sigType {
 	case sigTypeSecp256k1:
-		return verifySecp256k1(evm, target, input, gas, scope)
+		return verifySecp256k1(evm, target, payload, legacyHeader, gas, scope)
 	case sigTypeP256:
-		return verifyP256(evm, target, input, gas, scope)
+		return verifyP256(evm, target, payload, legacyHeader, gas, scope)
 	case sigTypeFalcon:
-		return verifyFalconEOA(evm, target, input, gas, scope, false)
+		return verifyFalconEOA(evm, target, payload, legacyHeader, gas, scope, false)
 	case sigTypeFalconEth:
-		return verifyFalconEOA(evm, target, input, gas, scope, true)
+		return verifyFalconEOA(evm, target, payload, legacyHeader, gas, scope, true)
 	default:
 		return nil, gas, ErrExecutionReverted
 	}
 }
 
+func defaultCodeSignatureHash(evm *EVM, legacyHeader []byte) []byte {
+	sigHash := evm.FrameCtx.SigHash
+	if len(legacyHeader) == 0 {
+		return sigHash[:]
+	}
+	hashInput := make([]byte, len(sigHash)+len(legacyHeader))
+	copy(hashInput, sigHash[:])
+	copy(hashInput[len(sigHash):], legacyHeader)
+	return crypto.Keccak256(hashInput)
+}
+
 // verifySecp256k1 verifies an ECDSA secp256k1 signature for EOA default code.
 //
-// Data layout: [byte0, 0x00, v(1), r(32), s(32)] = 67 bytes total
-// hash = keccak256(sig_hash || data_without_signature)
-// data_without_signature = input[:2] (the 2 header bytes)
-func verifySecp256k1(evm *EVM, target common.Address, input []byte, gas uint64, scope uint8) ([]byte, uint64, error) {
-	// Validate data length: 2 header + 65 signature = 67 bytes.
-	if len(input) != 67 {
+// Current payload layout: v(1) || r(32) || s(32).
+// Legacy signatures hash keccak256(sig_hash || embedded_header); current
+// signatures sign sig_hash directly.
+func verifySecp256k1(evm *EVM, target common.Address, payload, legacyHeader []byte, gas uint64, scope uint8) ([]byte, uint64, error) {
+	if len(payload) != 65 {
 		return nil, gas, ErrExecutionReverted
 	}
 
@@ -141,26 +191,18 @@ func verifySecp256k1(evm *EVM, target common.Address, input []byte, gas uint64, 
 	}
 	gas -= params.EcrecoverGas
 
-	// Charge keccak gas: 30 base + 6 per word (sig_hash=32 + header=2 = 34 bytes = 2 words).
-	keccakGas := params.Keccak256Gas + 2*params.Keccak256WordGas
-	if gas < keccakGas {
-		return nil, 0, ErrOutOfGas
+	if len(legacyHeader) != 0 {
+		keccakGas := params.Keccak256Gas + 2*params.Keccak256WordGas
+		if gas < keccakGas {
+			return nil, 0, ErrOutOfGas
+		}
+		gas -= keccakGas
 	}
-	gas -= keccakGas
 
-	fc := evm.FrameCtx
-	sigHash := fc.SigHash
-
-	v := input[2]
-	r := input[3:35]
-	s := input[35:67]
-	dataWithoutSig := input[:2] // prefix before (v, r, s)
-
-	// hash = keccak256(sig_hash || data_without_signature)
-	hashInput := make([]byte, 32+len(dataWithoutSig))
-	copy(hashInput, sigHash[:])
-	copy(hashInput[32:], dataWithoutSig)
-	hash := crypto.Keccak256(hashInput)
+	v := payload[0]
+	r := payload[1:33]
+	s := payload[33:65]
+	hash := defaultCodeSignatureHash(evm, legacyHeader)
 
 	// Build ecrecover input: (hash, v, r, s) each 32 bytes.
 	// The precompile expects v as 27 or 28.
@@ -187,13 +229,11 @@ func verifySecp256k1(evm *EVM, target common.Address, input []byte, gas uint64, 
 
 // verifyP256 verifies a P256 (secp256r1) signature for EOA default code.
 //
-// Data layout: [byte0, 0x01, r(32), s(32), qx(32), qy(32)] = 130 bytes total
-// hash = keccak256(sig_hash || data_without_signature)
-// data_without_signature = input[:2] (the 2 header bytes)
-// target must equal keccak256(qx || qy)[12:]
-func verifyP256(evm *EVM, target common.Address, input []byte, gas uint64, scope uint8) ([]byte, uint64, error) {
-	// Validate data length: 2 header + 128 signature = 130 bytes.
-	if len(input) != 130 {
+// Current payload layout: r(32) || s(32) || qx(32) || qy(32).
+// Current addresses are keccak256(0x01 || qx || qy)[12:]; the legacy format
+// used keccak256(qx || qy)[12:].
+func verifyP256(evm *EVM, target common.Address, payload, legacyHeader []byte, gas uint64, scope uint8) ([]byte, uint64, error) {
+	if len(payload) != 128 {
 		return nil, gas, ErrExecutionReverted
 	}
 
@@ -203,42 +243,37 @@ func verifyP256(evm *EVM, target common.Address, input []byte, gas uint64, scope
 	}
 	gas -= params.P256VerifyGas
 
-	// Charge keccak gas: two keccak calls.
-	// 1) hash = keccak256(sig_hash || data_without_sig): 34 bytes = 2 words
-	// 2) addr = keccak256(qx || qy): 64 bytes = 2 words
-	keccakGas := 2 * (params.Keccak256Gas + 2*params.Keccak256WordGas)
+	addressWords := uint64(3)
+	if len(legacyHeader) != 0 {
+		addressWords = 2
+	}
+	keccakGas := params.Keccak256Gas + addressWords*params.Keccak256WordGas
+	if len(legacyHeader) != 0 {
+		keccakGas += params.Keccak256Gas + 2*params.Keccak256WordGas
+	}
 	if gas < keccakGas {
 		return nil, 0, ErrOutOfGas
 	}
 	gas -= keccakGas
 
-	fc := evm.FrameCtx
-	sigHash := fc.SigHash
+	r := new(big.Int).SetBytes(payload[0:32])
+	s := new(big.Int).SetBytes(payload[32:64])
+	qx := new(big.Int).SetBytes(payload[64:96])
+	qy := new(big.Int).SetBytes(payload[96:128])
 
-	r := new(big.Int).SetBytes(input[2:34])
-	s := new(big.Int).SetBytes(input[34:66])
-	qx := new(big.Int).SetBytes(input[66:98])
-	qy := new(big.Int).SetBytes(input[98:130])
-	dataWithoutSig := input[:2] // prefix before (r, s, qx, qy)
-
-	// Verify target == keccak256(qx || qy)[12:].
-	pubKeyBytes := make([]byte, 64)
-	copy(pubKeyBytes[0:32], input[66:98])
-	copy(pubKeyBytes[32:64], input[98:130])
+	pubKeyBytes := make([]byte, 0, 65)
+	if len(legacyHeader) == 0 {
+		pubKeyBytes = append(pubKeyBytes, sigTypeP256)
+	}
+	pubKeyBytes = append(pubKeyBytes, payload[64:128]...)
 	addrHash := crypto.Keccak256(pubKeyBytes)
 	derivedAddr := common.BytesToAddress(addrHash[12:])
 	if derivedAddr != target {
 		return nil, gas, ErrExecutionReverted
 	}
 
-	// hash = keccak256(sig_hash || data_without_signature)
-	hashInput := make([]byte, 32+len(dataWithoutSig))
-	copy(hashInput, sigHash[:])
-	copy(hashInput[32:], dataWithoutSig)
-	hash := crypto.Keccak256(hashInput)
-
 	// Verify P256 signature.
-	if !secp256r1.Verify(hash, r, s, qx, qy) {
+	if !secp256r1.Verify(defaultCodeSignatureHash(evm, legacyHeader), r, s, qx, qy) {
 		return nil, gas, ErrExecutionReverted
 	}
 
@@ -248,19 +283,19 @@ func verifyP256(evm *EVM, target common.Address, input []byte, gas uint64, scope
 
 // verifyFalconEOA verifies a Falcon signature for EOA default code.
 //
-// Data layout: [byte0, sig_type, pubkey(896), sig(666)] = 1564 bytes total
-// hash = keccak256(sig_hash || data_without_signature)
-// data_without_signature = input[:2] (the 2 header bytes)
+// Payload layout: pubkey(896) || sig(666).
 // target must equal keccak256(ALG_TYPE || pubkey)[12:]
-func verifyFalconEOA(evm *EVM, target common.Address, input []byte, gas uint64, scope uint8, useKeccak bool) ([]byte, uint64, error) {
-	if len(input) != falconEOAInputSize {
+func verifyFalconEOA(evm *EVM, target common.Address, payload, legacyHeader []byte, gas uint64, scope uint8, useKeccak bool) ([]byte, uint64, error) {
+	if len(payload) != falconPKSize+falconSigSize {
 		return nil, gas, ErrExecutionReverted
 	}
 
-	// Charge keccak gas: two keccak calls.
-	// 1) hash = keccak256(sig_hash || data_without_sig): 34 bytes = 2 words
-	// 2) addr = keccak256(ALG_TYPE || pubkey): 897 bytes = 29 words
-	keccakGas := 2*params.Keccak256Gas + (2+29)*params.Keccak256WordGas
+	// Address derivation hashes 897 bytes. Legacy signatures additionally hash
+	// sig_hash || embedded_header.
+	keccakGas := params.Keccak256Gas + 29*params.Keccak256WordGas
+	if len(legacyHeader) != 0 {
+		keccakGas += params.Keccak256Gas + 2*params.Keccak256WordGas
+	}
 	if gas < keccakGas {
 		return nil, 0, ErrOutOfGas
 	}
@@ -272,12 +307,8 @@ func verifyFalconEOA(evm *EVM, target common.Address, input []byte, gas uint64, 
 	}
 	coreAddr := common.BytesToAddress([]byte{0x16})
 
-	fc := evm.FrameCtx
-	sigHash := fc.SigHash
-
-	pubKey := input[2 : 2+falconPKSize]
-	sig := input[2+falconPKSize:]
-	dataWithoutSig := input[:2]
+	pubKey := payload[:falconPKSize]
+	sig := payload[falconPKSize:]
 
 	// Verify target == keccak256(ALG_TYPE || pubkey)[12:].
 	derivedAddr, err := crypto.FalconPubkeyToAddress(pubKey)
@@ -295,11 +326,7 @@ func verifyFalconEOA(evm *EVM, target common.Address, input []byte, gas uint64, 
 		return nil, gas, ErrExecutionReverted
 	}
 
-	// hash = keccak256(sig_hash || data_without_signature)
-	hashInput := make([]byte, 32+len(dataWithoutSig))
-	copy(hashInput, sigHash[:])
-	copy(hashInput[32:], dataWithoutSig)
-	hash := crypto.Keccak256(hashInput)
+	hash := defaultCodeSignatureHash(evm, legacyHeader)
 
 	// EIP-8052 HASH_TO_POINT input: msg(32B) || sig(666B)
 	hashToPointInput := make([]byte, falconHashToPointInputSize)
@@ -335,8 +362,8 @@ func verifyFalconEOA(evm *EVM, target common.Address, input []byte, gas uint64, 
 // applyDefaultApprove sets the APPROVE status on the EVM, mirroring what
 // the APPROVE opcode does but from the default code path.
 func applyDefaultApprove(evm *EVM, target common.Address, scope uint8, gas uint64) ([]byte, uint64, error) {
-	// Validate scope: must be 0, 1, or 2.
-	if scope > 2 {
+	status, ok := approvalStatus(uint64(scope))
+	if !ok {
 		return nil, gas, ErrExecutionReverted
 	}
 
@@ -345,13 +372,12 @@ func applyDefaultApprove(evm *EVM, target common.Address, scope uint8, gas uint6
 		return nil, gas, ErrExecutionReverted
 	}
 
-	// For scope 0x0/0x2 (execution approval): target must be tx.sender.
-	if (scope == 0 || scope == 2) && target != fc.Sender {
+	// Execution approval requires target to be tx.sender.
+	if (status == ApproveExecution || status == ApproveBoth) && target != fc.Sender {
 		return nil, gas, ErrExecutionReverted
 	}
 
-	// Map scope operand to approval status code: scope + 2.
-	evm.ApproveScope = scope + 2
+	evm.ApproveScope = status
 	return nil, gas, nil
 }
 

@@ -33,12 +33,12 @@ import (
 
 // Bytecode constants for test contracts.
 var (
-	// APPROVE(0x2): approve both execution and payment.
+	// APPROVE(0x3): approve both execution and payment.
 	// PUSH1 0x02, PUSH1 0x00, PUSH1 0x00, APPROVE(0xaa)
-	approveBothCode = []byte{0x60, 0x02, 0x60, 0x00, 0x60, 0x00, 0xaa}
+	approveBothCode = []byte{0x60, 0x03, 0x60, 0x00, 0x60, 0x00, 0xaa}
 
-	// APPROVE(0x0): approve execution only.
-	approveExecCode = []byte{0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0xaa}
+	// APPROVE(0x2): approve execution only.
+	approveExecCode = []byte{0x60, 0x02, 0x60, 0x00, 0x60, 0x00, 0xaa}
 
 	// APPROVE(0x1): approve payment only.
 	approvePayCode = []byte{0x60, 0x01, 0x60, 0x00, 0x60, 0x00, 0xaa}
@@ -99,7 +99,7 @@ func TestFrameTxSimple(t *testing.T) {
 	sender := common.HexToAddress("0x1111")
 	target := common.HexToAddress("0x2222")
 
-	// Setup: sender has APPROVE(0x2) code and plenty of ETH.
+	// Setup: sender has APPROVE(0x3) code and plenty of ETH.
 	statedb.CreateAccount(sender)
 	statedb.SetCode(sender, approveBothCode, tracing.CodeChangeUnspecified)
 	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
@@ -136,6 +136,46 @@ func TestFrameTxSimple(t *testing.T) {
 	// Verify nonce was incremented (payer approval increments nonce).
 	if got := statedb.GetNonce(sender); got != 1 {
 		t.Fatalf("sender nonce: got %d, want 1", got)
+	}
+}
+
+func TestFrameTxSenderDirectEOATarget(t *testing.T) {
+	evm, statedb, config := newFrameTestEnv()
+
+	sender := common.HexToAddress("0x1111")
+	target := common.HexToAddress("0x2222")
+	value := uint256.NewInt(12345)
+
+	statedb.CreateAccount(sender)
+	statedb.SetCode(sender, approveBothCode, tracing.CodeChangeUnspecified)
+	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
+
+	ftx := &types.FrameTx{
+		ChainID: uint256.NewInt(config.ChainID.Uint64()),
+		Nonce:   0,
+		Sender:  sender,
+		Frames: []types.Frame{
+			{Mode: types.FrameModeVerify, Target: nil, GasLimit: 50000},
+			{Mode: types.FrameModeSender, Target: &target, GasLimit: 50000, Value: value},
+		},
+		GasTipCap:  uint256.NewInt(1),
+		GasFeeCap:  uint256.NewInt(uint64(params.InitialBaseFee)),
+		BlobFeeCap: new(uint256.Int),
+	}
+
+	msg := makeFrameMsg(ftx, config, big.NewInt(params.InitialBaseFee))
+	result, err := applyFrameTx(evm, config, msg)
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if result.Failed() {
+		t.Fatalf("execution result failed: %v", result.Err)
+	}
+	if got := statedb.GetBalance(target); !got.Eq(value) {
+		t.Fatalf("target balance: got %v, want %v", got, value)
+	}
+	if result.frameResults[1] != 1 {
+		t.Fatalf("sender frame status: got %d, want 1", result.frameResults[1])
 	}
 }
 
@@ -182,7 +222,7 @@ func TestFrameTxNoPayerApproval(t *testing.T) {
 	sender := common.HexToAddress("0x1111")
 	target := common.HexToAddress("0x2222")
 
-	// Sender code approves execution only (0x0), not payment.
+	// Sender code approves execution only (0x2), not payment.
 	statedb.CreateAccount(sender)
 	statedb.SetCode(sender, approveExecCode, tracing.CodeChangeUnspecified)
 	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
@@ -243,7 +283,7 @@ func TestFrameTxVerifyFailure(t *testing.T) {
 }
 
 // TestFrameTxSponsoredTransaction tests a sponsored transaction where sender and payer are different.
-// Frame 0: VERIFY on sender → APPROVE(0x0) (execution)
+// Frame 0: VERIFY on sender → APPROVE(0x2) (execution)
 // Frame 1: VERIFY on sponsor → APPROVE(0x1) (payment)
 // Frame 2: SENDER calls target
 func TestFrameTxSponsoredTransaction(t *testing.T) {
@@ -420,7 +460,7 @@ func TestFrameTxPayerInsufficientBalance(t *testing.T) {
 
 // TestFrameTxReApproveExecution tests that re-approving execution is rejected.
 // Per spec: "If sender_approved is already set, revert the frame."
-// Two VERIFY(sender) frames both APPROVE(0x0) → second frame reverts → tx invalid (VERIFY must APPROVE).
+// Two VERIFY(sender) frames both APPROVE(0x2) → second frame reverts → tx invalid (VERIFY must APPROVE).
 func TestFrameTxReApproveExecution(t *testing.T) {
 	evm, statedb, config := newFrameTestEnv()
 
@@ -462,7 +502,7 @@ func TestFrameTxPayBeforeSenderApproval(t *testing.T) {
 	statedb.SetCode(sponsor, approvePayCode, tracing.CodeChangeUnspecified)
 	statedb.SetBalance(sponsor, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
 
-	// Sponsor tries to APPROVE(0x1) first, before any sender APPROVE(0x0).
+	// Sponsor tries to APPROVE(0x1) first, before any sender APPROVE(0x2).
 	ftx := &types.FrameTx{
 		ChainID: uint256.NewInt(config.ChainID.Uint64()),
 		Nonce:   0,
@@ -483,7 +523,7 @@ func TestFrameTxPayBeforeSenderApproval(t *testing.T) {
 	t.Logf("got expected error: %v", err)
 }
 
-// TestFrameTxApproveBothAfterExec tests that APPROVE(0x2) after separate APPROVE(0x0) is rejected.
+// TestFrameTxApproveBothAfterExec tests that APPROVE(0x3) after separate APPROVE(0x2) is rejected.
 // Per spec: "If sender_approved == true and status is 4, revert the frame."
 func TestFrameTxApproveBothAfterExec(t *testing.T) {
 	evm, statedb, config := newFrameTestEnv()
@@ -494,14 +534,14 @@ func TestFrameTxApproveBothAfterExec(t *testing.T) {
 	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
 
 	// Sender code: calldata-dependent APPROVE.
-	// If calldata is non-zero → APPROVE(0x0) (execution only).
-	// If calldata is zero/empty → APPROVE(0x2) (both).
+	// If calldata is non-zero → APPROVE(0x2) (execution only).
+	// If calldata is zero/empty → APPROVE(0x3) (both).
 	conditionalApproveCode := []byte{
-		0x60, 0x00, 0x35, 0x15,                         // PUSH1 0, CALLDATALOAD, ISZERO
-		0x60, 0x0f, 0x57,                               // PUSH1 0x0f, JUMPI
-		0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0xaa, 0x00, // APPROVE(0x0), STOP
+		0x60, 0x00, 0x35, 0x15, // PUSH1 0, CALLDATALOAD, ISZERO
+		0x60, 0x0f, 0x57, // PUSH1 0x0f, JUMPI
+		0x60, 0x02, 0x60, 0x00, 0x60, 0x00, 0xaa, 0x00, // APPROVE(0x2), STOP
 		0x5b,                                     // JUMPDEST @15
-		0x60, 0x02, 0x60, 0x00, 0x60, 0x00, 0xaa, // APPROVE(0x2)
+		0x60, 0x03, 0x60, 0x00, 0x60, 0x00, 0xaa, // APPROVE(0x3)
 	}
 	statedb.SetCode(sender, conditionalApproveCode, tracing.CodeChangeUnspecified)
 
@@ -510,13 +550,13 @@ func TestFrameTxApproveBothAfterExec(t *testing.T) {
 		Nonce:   0,
 		Sender:  sender,
 		Frames: []types.Frame{
-			// Frame 0: non-zero calldata → APPROVE(0x0)
+			// Frame 0: non-zero calldata → APPROVE(0x2)
 			{Mode: types.FrameModeVerify, Target: nil, GasLimit: 50000,
 				Data: []byte{0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 					0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 					0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 					0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}},
-			// Frame 1: empty calldata → APPROVE(0x2)
+			// Frame 1: empty calldata → APPROVE(0x3)
 			{Mode: types.FrameModeVerify, Target: nil, GasLimit: 50000, Data: nil},
 		},
 		GasTipCap:  uint256.NewInt(1),
@@ -527,7 +567,7 @@ func TestFrameTxApproveBothAfterExec(t *testing.T) {
 	msg := makeFrameMsg(ftx, config, big.NewInt(params.InitialBaseFee))
 	_, err := applyFrameTx(evm, config, msg)
 	if err == nil {
-		t.Fatal("expected error: APPROVE(0x2) after separate APPROVE(0x0) should fail")
+		t.Fatal("expected error: APPROVE(0x3) after separate APPROVE(0x2) should fail")
 	}
 	t.Logf("got expected error: %v", err)
 }
@@ -549,8 +589,8 @@ func TestFrameTxTransientStorageReset(t *testing.T) {
 	//   TSTORE(slot=1, value=0x42)               -- set transient for next frame
 	//   RETURN
 	tstoreCode := []byte{
-		0x60, 0x01, 0x5c,             // PUSH1 1, TLOAD
-		0x60, 0x00, 0x55,             // PUSH1 0, SSTORE
+		0x60, 0x01, 0x5c, // PUSH1 1, TLOAD
+		0x60, 0x00, 0x55, // PUSH1 0, SSTORE
 		0x60, 0x42, 0x60, 0x01, 0x5d, // PUSH1 0x42, PUSH1 1, TSTORE
 		0x60, 0x00, 0x60, 0x00, 0xf3, // PUSH1 0, PUSH1 0, RETURN
 	}
@@ -591,7 +631,7 @@ func TestFrameTxTransientStorageReset(t *testing.T) {
 
 // TestFrameTxDeploymentFlow tests the 3-frame deployment pattern (Example 1b from spec).
 // Frame 0: DEFAULT(deployer) — simulates account deployment
-// Frame 1: VERIFY(sender) → APPROVE(0x2)
+// Frame 1: VERIFY(sender) → APPROVE(0x3)
 // Frame 2: SENDER(sender) — executes on behalf of sender
 func TestFrameTxDeploymentFlow(t *testing.T) {
 	evm, statedb, config := newFrameTestEnv()

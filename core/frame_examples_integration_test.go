@@ -30,7 +30,7 @@ import (
 )
 
 var (
-	integrationApproveBothCode = []byte{0x60, 0x02, 0x60, 0x00, 0x60, 0x00, 0xaa}
+	integrationApproveBothCode = []byte{0x60, 0x03, 0x60, 0x00, 0x60, 0x00, 0xaa}
 	integrationReturnCode      = []byte{0x60, 0x00, 0x60, 0x00, 0xf3}
 )
 
@@ -120,7 +120,7 @@ func approveIfCalldataElseReturn(scope byte) []byte {
 }
 
 // approveIfEntryPointElseTransferOneWei returns code that:
-// - caller == ENTRY_POINT: APPROVE(0x2)
+// - caller == ENTRY_POINT: APPROVE(0x3)
 // - otherwise: transfer 1 wei to recipient, then RETURN(0,0)
 func approveIfEntryPointElseTransferOneWei(entryPoint, recipient common.Address) []byte {
 	code := []byte{0x33, 0x73}
@@ -134,7 +134,7 @@ func approveIfEntryPointElseTransferOneWei(entryPoint, recipient common.Address)
 	code = append(code,
 		0x5a, 0xf1, 0x50,
 		0x60, 0x00, 0x60, 0x00, 0xf3,
-		0x5b, 0x60, 0x02, 0x60, 0x00, 0x60, 0x00, 0xaa,
+		0x5b, 0x60, 0x03, 0x60, 0x00, 0x60, 0x00, 0xaa,
 	)
 	return code
 }
@@ -207,7 +207,7 @@ func TestFrameTxExample1bIntegration(t *testing.T) {
 	deployer := common.HexToAddress("0x4444")
 
 	createContract(statedb, deployer, integrationReturnCode, uint256.NewInt(0))
-	createContract(statedb, sender, approveIfEntryPointElseReturn(params.FrameEntryPointAddress, 0x2), uint256.NewInt(1e18))
+	createContract(statedb, sender, approveIfEntryPointElseReturn(params.FrameEntryPointAddress, 0x3), uint256.NewInt(1e18))
 
 	tx := newFrameTx(config, 0, sender, []types.Frame{
 		{Mode: types.FrameModeDefault, Target: &deployer, GasLimit: 50_000, Data: []byte("initcode+salt")},
@@ -234,7 +234,7 @@ func TestFrameTxExample2Integration(t *testing.T) {
 	erc20 := common.HexToAddress("0x5555")
 	target := common.HexToAddress("0x2222")
 
-	createContract(statedb, sender, approveIfEntryPointElseReturn(params.FrameEntryPointAddress, 0x0), uint256.NewInt(1e15))
+	createContract(statedb, sender, approveIfEntryPointElseReturn(params.FrameEntryPointAddress, 0x2), uint256.NewInt(1e15))
 	createContract(statedb, sponsor, approveIfCalldataElseReturn(0x1), uint256.NewInt(1e18))
 	createContract(statedb, erc20, integrationReturnCode, uint256.NewInt(0))
 	createContract(statedb, target, integrationReturnCode, uint256.NewInt(0))

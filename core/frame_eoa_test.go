@@ -71,6 +71,22 @@ func buildEOAVerifyData(scope uint8, sigHash common.Hash, key *ecdsa.PrivateKey)
 	return data
 }
 
+// buildCurrentEOAVerifyData builds the current viem EOA VERIFY format:
+// sig_type(0x00) || v || r || s. Mode and scope are carried by the frame.
+func buildCurrentEOAVerifyData(sigHash common.Hash, key *ecdsa.PrivateKey) []byte {
+	sig, err := crypto.Sign(sigHash[:], key)
+	if err != nil {
+		panic(err)
+	}
+
+	data := make([]byte, 66)
+	data[0] = 0x00 // secp256k1
+	data[1] = sig[64]
+	copy(data[2:34], sig[0:32])
+	copy(data[34:66], sig[32:64])
+	return data
+}
+
 const (
 	testFalconPKSize  = 896
 	testFalconSigSize = 666
@@ -199,8 +215,8 @@ func TestEOADefaultCodeSimple(t *testing.T) {
 	// Compute sig hash (VERIFY frame data is elided).
 	sigHash := ftx.SigHash(config.ChainID)
 
-	// Build VERIFY frame data with APPROVE(0x2) scope.
-	verifyData := buildEOAVerifyData(2, sigHash, key)
+	// Build VERIFY frame data with APPROVE(0x3) scope.
+	verifyData := buildEOAVerifyData(3, sigHash, key)
 	ftx.Frames[0].Data = verifyData
 
 	msg := makeFrameMsg(ftx, config, big.NewInt(params.InitialBaseFee))
@@ -225,7 +241,7 @@ func TestEOADefaultCodeSimple(t *testing.T) {
 	t.Logf("recipient balance: %s", recipientBal)
 }
 
-// TestEOADefaultCodeVerifyOnly tests EOA VERIFY with APPROVE(0x2) and no SENDER frame.
+// TestEOADefaultCodeVerifyOnly tests EOA VERIFY with APPROVE(0x3) and no SENDER frame.
 func TestEOADefaultCodeVerifyOnly(t *testing.T) {
 	evm, statedb, config := newFrameTestEnv()
 
@@ -248,7 +264,7 @@ func TestEOADefaultCodeVerifyOnly(t *testing.T) {
 	}
 
 	sigHash := ftx.SigHash(config.ChainID)
-	ftx.Frames[0].Data = buildEOAVerifyData(2, sigHash, key)
+	ftx.Frames[0].Data = buildEOAVerifyData(3, sigHash, key)
 
 	msg := makeFrameMsg(ftx, config, big.NewInt(params.InitialBaseFee))
 	result, err := applyFrameTx(evm, config, msg)
@@ -260,6 +276,40 @@ func TestEOADefaultCodeVerifyOnly(t *testing.T) {
 	}
 	if got := statedb.GetNonce(sender); got != 1 {
 		t.Fatalf("sender nonce: got %d, want 1", got)
+	}
+}
+
+func TestEOADefaultCodeCurrentVerifyFormat(t *testing.T) {
+	evm, statedb, config := newFrameTestEnv()
+
+	key, _ := crypto.GenerateKey()
+	sender := crypto.PubkeyToAddress(key.PublicKey)
+
+	statedb.CreateAccount(sender)
+	statedb.SetBalance(sender, uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
+
+	ftx := &types.FrameTx{
+		ChainID: uint256.NewInt(config.ChainID.Uint64()),
+		Nonce:   0,
+		Sender:  sender,
+		Frames: []types.Frame{
+			{Mode: types.FrameModeVerify, Flags: 3, Target: nil, GasLimit: 100000},
+		},
+		GasTipCap:  uint256.NewInt(1),
+		GasFeeCap:  uint256.NewInt(uint64(params.InitialBaseFee)),
+		BlobFeeCap: new(uint256.Int),
+	}
+
+	sigHash := ftx.SigHash(config.ChainID)
+	ftx.Frames[0].Data = buildCurrentEOAVerifyData(sigHash, key)
+
+	msg := makeFrameMsg(ftx, config, big.NewInt(params.InitialBaseFee))
+	result, err := applyFrameTx(evm, config, msg)
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if result.Failed() {
+		t.Fatalf("execution result failed: %v", result.Err)
 	}
 }
 
@@ -278,7 +328,7 @@ func TestEOADefaultCodeFalcon(t *testing.T) {
 		Nonce:   0,
 		Sender:  sender,
 		Frames: []types.Frame{
-			{Mode: types.FrameModeVerify, Target: nil, GasLimit: 100000, Data: buildFalconEOAVerifyData(2, 0x04, pubKey, sig)},
+			{Mode: types.FrameModeVerify, Target: nil, GasLimit: 100000, Data: buildFalconEOAVerifyData(3, 0x04, pubKey, sig)},
 		},
 		GasTipCap:  uint256.NewInt(1),
 		GasFeeCap:  uint256.NewInt(uint64(params.InitialBaseFee)),
@@ -313,7 +363,7 @@ func TestEOADefaultCodeFalconEth(t *testing.T) {
 		Nonce:   0,
 		Sender:  sender,
 		Frames: []types.Frame{
-			{Mode: types.FrameModeVerify, Target: nil, GasLimit: 100000, Data: buildFalconEOAVerifyData(2, 0x05, pubKey, sig)},
+			{Mode: types.FrameModeVerify, Target: nil, GasLimit: 100000, Data: buildFalconEOAVerifyData(3, 0x05, pubKey, sig)},
 		},
 		GasTipCap:  uint256.NewInt(1),
 		GasFeeCap:  uint256.NewInt(uint64(params.InitialBaseFee)),
@@ -347,7 +397,7 @@ func TestEOADefaultCodeFalconWrongAddress(t *testing.T) {
 		Nonce:   0,
 		Sender:  sender,
 		Frames: []types.Frame{
-			{Mode: types.FrameModeVerify, Target: nil, GasLimit: 100000, Data: buildFalconEOAVerifyData(2, 0x04, pubKey, sig)},
+			{Mode: types.FrameModeVerify, Target: nil, GasLimit: 100000, Data: buildFalconEOAVerifyData(3, 0x04, pubKey, sig)},
 		},
 		GasTipCap:  uint256.NewInt(1),
 		GasFeeCap:  uint256.NewInt(uint64(params.InitialBaseFee)),
@@ -416,7 +466,7 @@ func TestEOADefaultCodeWrongSigner(t *testing.T) {
 
 	sigHash := ftx.SigHash(config.ChainID)
 	// Sign with wrong key — ecrecover will return a different address.
-	ftx.Frames[0].Data = buildEOAVerifyData(2, sigHash, wrongKey)
+	ftx.Frames[0].Data = buildEOAVerifyData(3, sigHash, wrongKey)
 
 	msg := makeFrameMsg(ftx, config, big.NewInt(params.InitialBaseFee))
 	_, err := applyFrameTx(evm, config, msg)
@@ -502,7 +552,7 @@ func TestEOADefaultCodeDefaultModeReverts(t *testing.T) {
 }
 
 // TestEOADefaultCodeSplitApproval tests EOA with split approval:
-// Frame 0: VERIFY with APPROVE(0x0) — execution only
+// Frame 0: VERIFY with APPROVE(0x2) — execution only
 // Frame 1: VERIFY with APPROVE(0x1) — payment only (using a contract)
 // Frame 2: SENDER — execute a call
 func TestEOADefaultCodeSplitApproval(t *testing.T) {
@@ -551,8 +601,8 @@ func TestEOADefaultCodeSplitApproval(t *testing.T) {
 
 	sigHash := ftx.SigHash(config.ChainID)
 
-	// EOA VERIFY with APPROVE(0x0) — execution only.
-	ftx.Frames[0].Data = buildEOAVerifyData(0, sigHash, key)
+	// EOA VERIFY with APPROVE(0x2) — execution only.
+	ftx.Frames[0].Data = buildEOAVerifyData(2, sigHash, key)
 
 	msg := makeFrameMsg(ftx, config, big.NewInt(params.InitialBaseFee))
 	result, err := applyFrameTx(evm, config, msg)
@@ -639,7 +689,7 @@ func TestEOADefaultCodeSenderMultipleCalls(t *testing.T) {
 	ftx.Frames[1].Data = senderData
 
 	sigHash := ftx.SigHash(config.ChainID)
-	ftx.Frames[0].Data = buildEOAVerifyData(2, sigHash, key)
+	ftx.Frames[0].Data = buildEOAVerifyData(3, sigHash, key)
 
 	msg := makeFrameMsg(ftx, config, big.NewInt(params.InitialBaseFee))
 	result, err := applyFrameTx(evm, config, msg)

@@ -851,19 +851,26 @@ func (st *stateTransition) executeFrames() (common.Address, []uint8, []uint64, [
 		st.evm.ApproveScope = vm.ApproveNone
 		snapshot := st.state.Snapshot()
 
-		// Execute the frame.
-		// If the target has no code (EOA), use the default code logic per EIP-8141.
+		// Execute the frame. EOA default code handles VERIFY frames and the
+		// legacy target-nil batched SENDER form. Direct SENDER frames execute
+		// against their target normally, including when the target is an EOA.
 		var (
 			ret         []byte
 			leftOverGas uint64
 			vmerr       error
 		)
-		if st.hasNoCode(target) {
+		useDefaultCode := st.hasNoCode(target) &&
+			(frame.Mode == types.FrameModeVerify || (frame.Mode == types.FrameModeSender && frame.Target == nil))
+		if useDefaultCode {
 			ret, leftOverGas, vmerr = vm.ExecuteDefaultCode(st.evm, caller, target, frame.Data, frame.GasLimit, frame.Mode)
 		} else if frame.Mode == types.FrameModeVerify {
 			ret, leftOverGas, vmerr = st.evm.StaticCall(caller, target, frame.Data, frame.GasLimit)
 		} else {
-			ret, leftOverGas, vmerr = st.evm.Call(caller, target, frame.Data, frame.GasLimit, new(uint256.Int))
+			value := frame.Value
+			if value == nil {
+				value = new(uint256.Int)
+			}
+			ret, leftOverGas, vmerr = st.evm.Call(caller, target, frame.Data, frame.GasLimit, value)
 		}
 		_ = ret
 
@@ -888,7 +895,7 @@ func (st *stateTransition) executeFrames() (common.Address, []uint8, []uint64, [
 			senderChanged := false
 
 			// Rule for status 2 (execution approval).
-			// Note: opApprove already ensures target == sender for scope 0/2,
+			// Note: opApprove already ensures target == sender for scope 2/3,
 			// but we keep this check as defense-in-depth.
 			if approveStatus == vm.ApproveExecution || approveStatus == vm.ApproveBoth {
 				if target == msg.From {
