@@ -18,6 +18,7 @@ package vm
 
 import (
 	"bytes"
+	"math/rand"
 	"testing"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -562,14 +563,75 @@ func TestFalconHashToPointKeccakVsShake(t *testing.T) {
 // Polynomial arithmetic
 // ---------------------------------------------------------------------------
 
+func TestNTTRoundTrip(t *testing.T) {
+	rng := rand.New(rand.NewSource(8141))
+	for trial := 0; trial < 20; trial++ {
+		var polynomial [falconN]int32
+		for i := range polynomial {
+			polynomial[i] = int32(rng.Intn(2*falconQ) - falconQ)
+		}
+		got := falconINTT(falconNTT(polynomial))
+		for i := range polynomial {
+			want := falconMod(int64(polynomial[i]))
+			if got[i] != want {
+				t.Fatalf("trial %d coefficient %d: got %d, want %d", trial, i, got[i], want)
+			}
+		}
+	}
+}
+
+func TestPolyMulNTTvsSchoolbook(t *testing.T) {
+	rng := rand.New(rand.NewSource(8052))
+	for trial := 0; trial < 20; trial++ {
+		var a, b [falconN]int32
+		for i := range a {
+			a[i] = int32(rng.Intn(2*falconQ) - falconQ)
+			b[i] = int32(rng.Intn(2*falconQ) - falconQ)
+		}
+		got := falconPolyMulNTT(a, b)
+		want := falconPolyMulSchoolbook(a, b)
+		for i := range got {
+			if got[i] != want[i] {
+				t.Fatalf("trial %d coefficient %d: got %d, want %d", trial, i, got[i], want[i])
+			}
+		}
+	}
+}
+
 func TestFalconPolyMulByZero(t *testing.T) {
 	var a, b [falconN]int32
 	a[0] = 1
-	result := falconPolyMul(a, b)
+	result := falconPolyMulNTT(a, b)
 	for i, v := range result {
 		if v != 0 {
 			t.Fatalf("result[%d] = %d, want 0", i, v)
 		}
+	}
+}
+
+var falconPolyMulBenchmarkSink [falconN]int32
+
+func BenchmarkFalconCoreSchoolbook(b *testing.B) {
+	var a, c [falconN]int32
+	for i := range a {
+		a[i] = int32((i*7919 + 17) % falconQ)
+		c[i] = int32((i*3571 + 29) % falconQ)
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		falconPolyMulBenchmarkSink = falconPolyMulSchoolbook(a, c)
+	}
+}
+
+func BenchmarkFalconCoreNTT(b *testing.B) {
+	var a, c [falconN]int32
+	for i := range a {
+		a[i] = int32((i*7919 + 17) % falconQ)
+		c[i] = int32((i*3571 + 29) % falconQ)
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		falconPolyMulBenchmarkSink = falconPolyMulNTT(a, c)
 	}
 }
 
@@ -580,7 +642,7 @@ func TestFalconPolyMulByOne(t *testing.T) {
 		a[i] = int32(i % falconQ)
 	}
 	one[0] = 1
-	result := falconPolyMul(a, one)
+	result := falconPolyMulNTT(a, one)
 	for i := range a {
 		if result[i] != a[i] {
 			t.Fatalf("result[%d] = %d, want %d", i, result[i], a[i])
@@ -596,7 +658,7 @@ func TestFalconPolyMulNegacyclic(t *testing.T) {
 
 	result := x
 	for i := 1; i < falconN; i++ {
-		result = falconPolyMul(result, x)
+		result = falconPolyMulNTT(result, x)
 	}
 	// result = x^n mod (x^n+1, q) = −1 = [q−1, 0, 0, ...]
 	if result[0] != falconQ-1 {
@@ -722,7 +784,7 @@ func TestFalconVerifyValidSig(t *testing.T) {
 	}
 
 	// Compute c = s1 + h·s2 mod (q, x^n+1).
-	hs2 := falconPolyMul(h, s2)
+	hs2 := falconPolyMulNTT(h, s2)
 	c := make([]int32, falconN)
 	for i := 0; i < falconN; i++ {
 		v := s1[i] + hs2[i]

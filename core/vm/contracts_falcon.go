@@ -37,9 +37,24 @@ const (
 
 	falconHashToPointInputSize = falconMsgSize + falconSigSize
 	falconCoreInputSize        = falconSigSize + falconPKSize + falconChallengeSize
+
+	// Falcon's q supports a primitive 1024th root because q-1 = 12*1024.
+	// psi is a primitive 1024th root and omega=psi² is a primitive 512th root.
+	falconNTTPsi      int32 = 10302
+	falconNTTOmega    int32 = 3400
+	falconNTTInvOmega int32 = 2859
+	falconNTTInvN     int32 = 12265
+	falconNTTInvPsi   int32 = 8974
 )
 
 var errFalconInvalidInputLength = errors.New("invalid Falcon precompile input length")
+
+var (
+	nttRoots         = falconRootPowers(falconNTTOmega)
+	nttInverseRoots  = falconRootPowers(falconNTTInvOmega)
+	nttTwistRoots    = falconRootPowers(falconNTTPsi)
+	nttInvTwistRoots = falconRootPowers(falconNTTInvPsi)
+)
 
 // falconHashToPointShake256 is a stub precompile for EIP-8052
 // FALCON_HASH_TO_POINT_SHAKE256.
@@ -135,7 +150,7 @@ func falconCoreVerify(sig, pkRaw, challengeRaw []byte) bool {
 	if !ok {
 		return false
 	}
-	hs2 := falconPolyMul(h, s2)
+	hs2 := falconPolyMulNTT(h, s2)
 	s1 := falconPolySub(challenge, hs2)
 	if !falconNormCheck(s1, s2) {
 		return false
@@ -331,10 +346,128 @@ func falconHashToPoint(nonce, msg []byte, useKeccak bool) [falconN]int32 {
 // Polynomial arithmetic in Z_q[x]/(x^n+1)
 // ---------------------------------------------------------------------------
 
-// falconPolyMul multiplies two polynomials modulo (x^n+1, q) using
-// schoolbook O(n²) multiplication. Intermediate sums use int64 to
-// avoid overflow (max |accumulator| ≈ 512 × 12288 × 8192 ≈ 5×10^10).
-func falconPolyMul(a, b [falconN]int32) [falconN]int32 {
+func falconMod(value int64) int32 {
+	value %= int64(falconQ)
+	if value < 0 {
+		value += int64(falconQ)
+	}
+	return int32(value)
+}
+
+func falconRootPowers(root int32) [falconN]int32 {
+	var powers [falconN]int32
+	powers[0] = 1
+	for i := 1; i < falconN; i++ {
+		powers[i] = int32(int64(powers[i-1]) * int64(root) % int64(falconQ))
+	}
+	return powers
+}
+
+// falconNTT computes a cyclic size-512 NTT using omega, a primitive 512th
+// root of unity. Inputs are normalized into [0,q-1].
+func falconNTT(a [falconN]int32) [falconN]int32 {
+	for i := 0; i < falconN; i++ {
+		a[i] = falconMod(int64(a[i]))
+	}
+	falconBitReverse(&a)
+
+	for length := 2; length <= falconN; length <<= 1 {
+		rootStep := nttRoots[falconN/length]
+		half := length >> 1
+		for offset := 0; offset < falconN; offset += length {
+			root := int32(1)
+			for j := 0; j < half; j++ {
+				even := a[offset+j]
+				odd := int32(int64(a[offset+j+half]) * int64(root) % int64(falconQ))
+
+				sum := even + odd
+				if sum >= falconQ {
+					sum -= falconQ
+				}
+				diff := even - odd
+				if diff < 0 {
+					diff += falconQ
+				}
+				a[offset+j] = sum
+				a[offset+j+half] = diff
+				root = int32(int64(root) * int64(rootStep) % int64(falconQ))
+			}
+		}
+	}
+	return a
+}
+
+// falconINTT computes the inverse cyclic size-512 NTT.
+func falconINTT(a [falconN]int32) [falconN]int32 {
+	for i := 0; i < falconN; i++ {
+		a[i] = falconMod(int64(a[i]))
+	}
+	falconBitReverse(&a)
+
+	for length := 2; length <= falconN; length <<= 1 {
+		rootStep := nttInverseRoots[falconN/length]
+		half := length >> 1
+		for offset := 0; offset < falconN; offset += length {
+			root := int32(1)
+			for j := 0; j < half; j++ {
+				even := a[offset+j]
+				odd := int32(int64(a[offset+j+half]) * int64(root) % int64(falconQ))
+
+				sum := even + odd
+				if sum >= falconQ {
+					sum -= falconQ
+				}
+				diff := even - odd
+				if diff < 0 {
+					diff += falconQ
+				}
+				a[offset+j] = sum
+				a[offset+j+half] = diff
+				root = int32(int64(root) * int64(rootStep) % int64(falconQ))
+			}
+		}
+	}
+	for i := 0; i < falconN; i++ {
+		a[i] = int32(int64(a[i]) * int64(falconNTTInvN) % int64(falconQ))
+	}
+	return a
+}
+
+func falconBitReverse(a *[falconN]int32) {
+	for i, j := 1, 0; i < falconN; i++ {
+		bit := falconN >> 1
+		for ; j&bit != 0; bit >>= 1 {
+			j ^= bit
+		}
+		j ^= bit
+		if i < j {
+			a[i], a[j] = a[j], a[i]
+		}
+	}
+}
+
+// falconPolyMulNTT multiplies in Z_q[x]/(x^512+1). Multiplying coefficient i
+// by psi^i maps negacyclic convolution to cyclic convolution under omega=psi².
+func falconPolyMulNTT(a, b [falconN]int32) [falconN]int32 {
+	for i := 0; i < falconN; i++ {
+		a[i] = int32(int64(falconMod(int64(a[i]))) * int64(nttTwistRoots[i]) % int64(falconQ))
+		b[i] = int32(int64(falconMod(int64(b[i]))) * int64(nttTwistRoots[i]) % int64(falconQ))
+	}
+	a = falconNTT(a)
+	b = falconNTT(b)
+	for i := 0; i < falconN; i++ {
+		a[i] = int32(int64(a[i]) * int64(b[i]) % int64(falconQ))
+	}
+	a = falconINTT(a)
+	for i := 0; i < falconN; i++ {
+		a[i] = int32(int64(a[i]) * int64(nttInvTwistRoots[i]) % int64(falconQ))
+	}
+	return a
+}
+
+// falconPolyMulSchoolbook multiplies two polynomials modulo (x^n+1, q) using
+// schoolbook O(n²) multiplication. It is retained as a correctness reference.
+func falconPolyMulSchoolbook(a, b [falconN]int32) [falconN]int32 {
 	var acc [falconN]int64
 	for i := 0; i < falconN; i++ {
 		for j := 0; j < falconN; j++ {
@@ -350,11 +483,7 @@ func falconPolyMul(a, b [falconN]int32) [falconN]int32 {
 	}
 	var result [falconN]int32
 	for i := 0; i < falconN; i++ {
-		r := acc[i] % int64(falconQ)
-		if r < 0 {
-			r += int64(falconQ)
-		}
-		result[i] = int32(r)
+		result[i] = falconMod(acc[i])
 	}
 	return result
 }
